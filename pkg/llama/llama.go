@@ -154,7 +154,7 @@ type HParams struct {
 	headsCount  uint32 // 32
 	layersCount uint32 // 32
 	rotCount    uint32 // 64
-	f16         uint32
+	ftype       uint32
 }
 
 // ModelType is the type of the model.
@@ -236,10 +236,8 @@ func Eval(
 	}
 
 	// Initialize the embd tensor with the tokensFloat32 data
-	embd := ml.NewTensor1D(ctx0, ml.TYPE_F32, uint32(len(tokens))) // Reusable OK
-	for i, token := range tokens {
-		embd.Data[i] = float32(token)
-	}
+	embd := ml.NewTensor1D(ctx0, ml.TYPE_I8, 0) // Data will be appended in blocks
+	ml.HydrateTensorFromUI32(embd, tokens)
 
 	inpL := ml.GetRows(ctx0, model.tokEmbeddings, embd)
 
@@ -299,6 +297,7 @@ func Eval(
 			// K * Q
 			KQ := ml.MulMat(ctx0, K, Q)
 
+			//@todo
 			// KQ_scaled = KQ / sqrt(n_embd/n_head)
 			KQScaled :=
 				ml.Scale(ctx0,
@@ -746,7 +745,7 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 	headsCount := readInt(file)  // n_heads
 	layersCount := readInt(file) // n_layers
 	rotCount := readInt(file)    // [obsolete] rot = dim // n_heads
-	f16 := readInt(file)         // ftype
+	ftype := readInt(file)       // ftype
 
 	model := NewModel(params)
 
@@ -756,7 +755,7 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 	model.hparams.headsCount = headsCount
 	model.hparams.layersCount = layersCount
 	model.hparams.rotCount = rotCount
-	model.hparams.f16 = f16
+	model.hparams.ftype = ftype
 
 	ffSize := ((2*(4*embdSize)/3 + multSize - 1) / multSize) * multSize
 
@@ -770,7 +769,7 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		fmt.Printf("\nlayers = %d", layersCount)
 		fmt.Printf("\nff     = %d", ffSize)
 		fmt.Printf("\nrot    = %d", rotCount)
-		fmt.Printf("\nf16    = %d", f16)
+		fmt.Printf("\nftype    = %d", ftype)
 	}
 
 	// --- load vocab
@@ -817,10 +816,10 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 
 	// --- prepare memory for the weights
 	{
-		model.tokEmbeddings = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, vocabSize) // Fixed OK
+		model.tokEmbeddings = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, vocabSize) // Fixed OK
 
-		model.norm = ml.NewTensor1D(nil, ml.TYPE_F32, embdSize)                        // Fixed OK
-		model.output = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, vocabSize) // Fixed OK
+		model.norm = ml.NewTensor1D(nil, ml.DType(ftype), embdSize)                        // Fixed OK
+		model.output = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, vocabSize) // Fixed OK
 
 		// map by name
 		model.tensors["tok_embeddings.weight"] = model.tokEmbeddings
@@ -831,18 +830,18 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		model.layers = make([]Layer, layersCount)
 		for i := uint32(0); i < layersCount; i++ {
 
-			model.layers[i].attentionNorm = ml.NewTensor1D(nil, ml.TYPE_F32, embdSize) // Fixed OK
+			model.layers[i].attentionNorm = ml.NewTensor1D(nil, ml.DType(ftype), embdSize) // Fixed OK
 
-			model.layers[i].wq = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, embdSize) // Fixed OK
-			model.layers[i].wk = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, embdSize) // Fixed OK
-			model.layers[i].wv = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, embdSize) // Fixed OK
-			model.layers[i].wo = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, embdSize) // Fixed OK
+			model.layers[i].wq = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
+			model.layers[i].wk = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
+			model.layers[i].wv = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
+			model.layers[i].wo = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
 
-			model.layers[i].ffn_norm = ml.NewTensor1D(nil, ml.TYPE_F32, embdSize)
+			model.layers[i].ffn_norm = ml.NewTensor1D(nil, ml.DType(ftype), embdSize)
 
-			model.layers[i].w1 = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, ffSize) // Fixed OK
-			model.layers[i].w2 = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, ffSize, embdSize) // Fixed OK
-			model.layers[i].w3 = ml.NewTensor2D(nil, ml.TYPE_F32 /*wtype*/, embdSize, ffSize) // Fixed OK
+			model.layers[i].w1 = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, ffSize) // Fixed OK
+			model.layers[i].w2 = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, ffSize, embdSize) // Fixed OK
+			model.layers[i].w3 = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, ffSize) // Fixed OK
 
 			// map by name
 			prefix := fmt.Sprintf("layers.%d.", i)
@@ -911,9 +910,16 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 
 		if ml.DEBUG {
 			typeStr := "FP32"
-			if shardType == ml.TYPE_F16 {
+
+			switch shardType {
+			case ml.TYPE_F16:
 				typeStr = "FP16"
+			case ml.TYPE_I8:
+				typeStr = "I8"
 			}
+			//if shardType == ml.TYPE_F16 {
+			//	typeStr = "FP16"
+			//}
 			memStr := fmt.Sprintf("%dM", nelements*4/1024/1024)
 			fmt.Printf("\n=== LAYER #%d === %s | %s | %s ===", tensorsCount, typeStr, name, memStr)
 		}
@@ -953,6 +959,19 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 				fmt.Printf("\n[ERROR] COUNT = %d | ERR = %s", count, err.Error())
 				os.Exit(1)
 			}
+		case ml.TYPE_I8:
+			// Quantized representation: for every 32 values, compute a scalar and int8 representations
+			blockSize := uint32(32)
+			blocksCount := tensorSize / blockSize
+
+			for i := uint32(0); i < blocksCount; i++ {
+				tensor.Scalars[i] = readFP32(file)
+
+				for j := uint32(0); j < blockSize; j++ {
+					tensor.Data[i*blockSize+j] = readInt8(file)
+				}
+			}
+
 		default:
 			fmt.Printf("\n[ERROR] Tensor data type is not supported yet!")
 			os.Exit(0)
@@ -990,6 +1009,14 @@ func readInt(file *os.File) uint32 {
 		return 0
 	}
 	return uint32(buf[3])<<24 | uint32(buf[2])<<16 | uint32(buf[1])<<8 | uint32(buf[0])
+}
+
+func readInt8(file *os.File) int8 {
+	buf := make([]byte, 1)
+	if count, err := file.Read(buf); err != nil || count != 1 {
+		return 0
+	}
+	return int8(buf[0])
 }
 
 // readString reads a string from the file

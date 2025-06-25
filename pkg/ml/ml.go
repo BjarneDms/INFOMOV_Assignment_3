@@ -103,6 +103,8 @@ func printTensor(tensor *Tensor, name string) {
 		dt = "FP32"
 	case TYPE_Q4_0:
 		dt = "INT4"
+	case TYPE_I8:
+		dt = "INT8"
 	}
 
 	fmt.Printf("\n\n=== [ %s | %s | %d:%d:%d ] ===\n",
@@ -199,7 +201,8 @@ type Tensor struct {
 
 	TasksCount int
 
-	Data []float32
+	Scalars []float32
+	Data    []int8
 }
 
 // ggml_is_contiguous
@@ -229,12 +232,12 @@ func (t *Tensor) Nbytes() uint32 {
 
 // ggml_view_tensor
 func ViewTensor(ctx *Context, src *Tensor) *Tensor {
-	return NewTensor(ctx, src.Type, src.Dims, src.NE[0], src.NE[1], src.NE[2], src.NE[3], src.Data)
+	return NewTensor(ctx, src.Type, src.Dims, src.NE[0], src.NE[1], src.NE[2], src.NE[3], src.Scalars, src.Data)
 }
 
 // ggml_dup_tensor
 func DupTensor(ctx *Context, src *Tensor) *Tensor {
-	return NewTensor(ctx, src.Type, src.Dims, src.NE[0], src.NE[1], src.NE[2], src.NE[3], nil) // Reusbale OK
+	return NewTensor(ctx, src.Type, src.Dims, src.NE[0], src.NE[1], src.NE[2], src.NE[3], nil, nil) // Reusbale OK
 }
 
 // struct ggml_tensor * Mul(
@@ -302,7 +305,7 @@ func MulMat(ctx *Context, a, b *Tensor) *Tensor {
 		isNode = true
 	}
 
-	result := NewTensor(ctx, TYPE_F32, min32(a.Dims, b.Dims), a.NE[1], b.NE[1], a.NE[2], b.NE[3], nil) // Reusable OK
+	result := NewTensor(ctx, TYPE_F32, min32(a.Dims, b.Dims), a.NE[1], b.NE[1], a.NE[2], b.NE[3], nil, nil) // Reusable OK
 
 	result.op = OP_MUL_MAT
 	result.src0 = a
@@ -541,7 +544,39 @@ func GetRows(ctx *Context, a, b *Tensor) *Tensor {
 		os.Exit(1)
 	}
 
-	result := NewTensor2D(ctx, TYPE_F32, a.NE[0], b.NE[0]) // Reusable OK
+	result := NewTensor2D(ctx, TYPE_I8, a.NE[0], b.NE[0]) // Reusable OK
+
+	result.op = OP_GET_ROWS
+	if isNode {
+		result.grad = DupTensor(ctx, result)
+	} else {
+		result.grad = nil
+	}
+
+	result.src0 = a
+	result.src1 = b
+
+	return result
+}
+
+// ggml_get_rows
+func GetRowsI8(ctx *Context, a, b *Tensor) *Tensor {
+	////ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && b.type == TYPE_I32);
+	//if !IsMatrix(a) || !IsVector(b) /* || b.Type != TYPE_I32 */ {
+	//	fmt.Printf("\n[ERROR] GetRows fail basic assertions")
+	//	os.Exit(1)
+	//}
+
+	isNode := false
+
+	if a.grad != nil || b.grad != nil {
+		////ASSERT(false); // TODO: implement backward
+		isNode = true
+		fmt.Printf("\n[STOP] ml.GetRows")
+		os.Exit(1)
+	}
+
+	result := NewTensor2D(ctx, TYPE_I8, a.NE[0], b.NE[0]) // Reusable OK
 
 	result.op = OP_GET_ROWS
 	if isNode {
@@ -740,24 +775,58 @@ func CopyInplace(ctx *Context, a, b *Tensor) *Tensor {
 
 // ggml_new_tensor_1d
 func NewTensor1D(ctx *Context, dt DType, ne0 uint32) *Tensor {
-	return NewTensor(ctx, dt, 1, ne0, 1, 1, 1, nil)
+	return NewTensor(ctx, dt, 1, ne0, 1, 1, 1, nil, nil)
 }
 
 // ggml_new_tensor_2d
 func NewTensor2D(ctx *Context, dt DType, ne0, ne1 uint32) *Tensor {
-	return NewTensor(ctx, dt, 2, ne0, ne1, 1, 1, nil)
+	return NewTensor(ctx, dt, 2, ne0, ne1, 1, 1, nil, nil)
 }
 
 func NewTensor3D(ctx *Context, dt DType, ne0, ne1, ne2 uint32) *Tensor {
-	return NewTensor(ctx, dt, 3, ne0, ne1, ne2, 1, nil)
+	return NewTensor(ctx, dt, 3, ne0, ne1, ne2, 1, nil, nil)
 }
 
 func NewTensor4D(ctx *Context, dt DType, ne0, ne1, ne2, ne3 uint32) *Tensor {
-	return NewTensor(ctx, dt, 4, ne0, ne1, ne2, ne3, nil)
+	return NewTensor(ctx, dt, 4, ne0, ne1, ne2, ne3, nil, nil)
+}
+
+func HydrateTensorFromFP32(t *Tensor, values []float32) {
+	// implement
+}
+
+func HydrateTensorFromUI32(t *Tensor, values []uint32) {
+	blockSize := 32
+	for i := 0; i < len(values); i += blockSize {
+		end := i + blockSize
+		if end > len(values) {
+			end = len(values)
+		}
+		block := values[i:end]
+
+		// Compute the max absolute value as scalar
+		maxAbs := float32(0.0)
+		for _, token := range block {
+			val := float32(token)
+			if absVal := float32(math.Abs(float64(val))); absVal > maxAbs {
+				maxAbs = absVal
+			}
+		}
+		if maxAbs == 0.0 {
+			maxAbs = 1.0 // Avoid divide-by-zero
+		}
+		t.Scalars = append(t.Scalars, maxAbs)
+
+		// Normalize and append to Data
+		for _, token := range block {
+			val := float32(token) / maxAbs
+			t.Data = append(t.Data, int8(val))
+		}
+	}
 }
 
 // ggml_new_tensor_impl
-func NewTensor(ctx *Context, dt DType, dims uint32, ne0, ne1, ne2, ne3 uint32, data []float32) *Tensor {
+func NewTensor(ctx *Context, dt DType, dims uint32, ne0, ne1, ne2, ne3 uint32, scalars []float32, data []int8) *Tensor {
 
 	// TODO: Check allowed data types on graph creation
 	//if dt != TYPE_F32 && dt != TYPE_I32 {
@@ -773,12 +842,13 @@ func NewTensor(ctx *Context, dt DType, dims uint32, ne0, ne1, ne2, ne3 uint32, d
 	}
 
 	return &Tensor{
-		Type: dt,
-		Dims: dims,
-		NE:   [4]uint32{ne0, ne1, ne2, ne3},
-		NB:   [4]uint32{4, ne0 * 4, ne0 * ne1 * 4, ne0 * ne1 * ne2 * 4},
-		op:   OP_NONE,
-		Data: data,
+		Type:    dt,
+		Dims:    dims,
+		NE:      [4]uint32{ne0, ne1, ne2, ne3},
+		NB:      [4]uint32{4, ne0 * 4, ne0 * ne1 * 4, ne0 * ne1 * ne2 * 4},
+		op:      OP_NONE,
+		Scalars: scalars,
+		Data:    data,
 	}
 }
 
@@ -928,6 +998,24 @@ func SetFP32(tensor *Tensor, value float32) *Tensor {
 	}
 	return tensor
 }
+
+//// ggml_new_f32
+//func NewFiP8(ctx *Context, value int8) *Tensor {
+//	result := NewTensor1D(ctx, TYPE_I8, 1) // Reusable OK
+//	SetFiP8(result, value)
+//	return result
+//}
+
+//// ggml_set_f32
+//func SetFiP8(tensor *Tensor, value int8) *Tensor {
+//	// FIXME Optimize with mem zeroing
+//	n := tensor.Nelements()
+//	for i := uint32(0); i < n; i++ {
+//		////ggml_vec_set_f32(nc, (float *)(data + i*n1), value);
+//		tensor.Data[i] = value
+//	}
+//	return tensor
+//}
 
 // ggml_scale
 func ScaleImpl(ctx *Context, a, b *Tensor, inplace bool) *Tensor {
@@ -1638,15 +1726,15 @@ func ComputeForward(ctx *Context, graph *Graph, params *ComputeParams, tensor *T
 				wg:     wg,
 			}
 
-			/* go Do(&ComputeParams{
-				Type:    TASK_COMPUTE,
-				ith:     uint32(i),
-				nth:     uint32(maxThreads),
-				tensor:  tensor,
-				UseNEON: graph.UseNEON,
-				UseAVX:  graph.UseAVX,
-				wg:      wg,
-			}, i) */
+			//go Do(&ComputeParams{
+			//	Type:    TASK_COMPUTE,
+			//	ith:     uint32(i),
+			//	nth:     uint32(maxThreads),
+			//	tensor:  tensor,
+			//	UseNEON: graph.UseNEON,
+			//	UseAVX:  graph.UseAVX,
+			//	wg:      wg,
+			//}, i)
 		}
 
 		wg.Wait()
@@ -1707,6 +1795,16 @@ func VecCopyFP32(n uint32, y, x []float32) {
 	}
 }
 
+func VecCopyI8(n uint32, scalarX, scalarY []float32, y, x []int8) {
+	for i := uint32(0); i <= (n / 32); i++ {
+		scalarY[i] = scalarX[i]
+	}
+
+	for i := uint32(0); i < n; i++ {
+		y[i] = x[i]
+	}
+}
+
 // ggml_compute_forward_get_rows_f32
 func ComputeForwardGetRows(params *ComputeParams, src0, src1, dst *Tensor) {
 
@@ -1745,7 +1843,14 @@ func ComputeForwardGetRows(params *ComputeParams, src0, src1, dst *Tensor) {
 		// FIXME ASAP and double check!
 		// VecCopyFP32(nc, (*dst.Data)[i*dst.NE[0]:], (*src0.Data)[uint32(r)*src0.NE[0]:])
 		// VecCopyFP32(nc, dst.Data[i*dst.NB[1]/4:], src0.Data[r*src0.NB[1]/4:])
-		VecCopyFP32(nc, dst.Data[i*dst.NE[0]:], src0.Data[r*src0.NE[0]:]) // TODO copy()
+		//VecCopyFP32(nc, dst.Data[i*dst.NE[0]:], src0.Data[r*src0.NE[0]:]) // TODO copy()
+		VecCopyI8(
+			nc,
+			dst.Scalars[i*dst.NE[0]/32:],
+			dst.Scalars[i*dst.NE[0]/32:],
+			dst.Data[i*dst.NE[0]:],
+			src0.Data[r*src0.NE[0]:],
+		) // TODO copy()
 	}
 }
 
@@ -1818,6 +1923,13 @@ func VecScaleFP32(n uint32, y []float32, v float32) {
 	}
 }
 
+// ggml_vec_scale_f32
+func VecScaleI8(n uint32, y []uint8, v uint8) {
+	for i := uint32(0); i < n; i++ {
+		y[i] *= v
+	}
+}
+
 // ggml_compute_forward_repeat
 func ComputeForwardRepeatFP32(params *ComputeParams, src0, dst *Tensor) {
 
@@ -1873,6 +1985,13 @@ func VecMulFP32(n uint32, z, x, y []float32) {
 	}
 }
 
+func VecMulI8(n uint32, scalar []float32, z, x, y []unit8) {
+	for i := uint32(0); i < n; i++ {
+		scalarIndex := n / 32
+		z[i] = (scalar[scalarIndex] * x[i]) * (scalar[scalarIndex] * y[i])
+	}
+}
+
 // ggml_compute_forward_mul
 func ComputeForwardMulFP32(params *ComputeParams, src0, src1, dst *Tensor) {
 
@@ -1903,7 +2022,8 @@ func ComputeForwardMulFP32(params *ComputeParams, src0, src1, dst *Tensor) {
 		////(float *) ((char *) src1->data + i*(src1->nb[1])));
 
 		// FIXME NE vs NB
-		VecMulFP32(nc, dst.Data[i*dst.NE[0]:], src0.Data[i*src0.NE[0]:], src1.Data[i*src1.NE[0]:])
+		VecMulI8(nc, dst.Scalars[i:], dst.Data[i*nc:], src0.Data[i*nc:], src1.Data[i*nc:])
+		//VecMulFP32(nc, dst.Data[i*dst.NE[0]:], src0.Data[i*src0.NE[0]:], src1.Data[i*src1.NE[0]:])
 	}
 
 	if DEBUG {

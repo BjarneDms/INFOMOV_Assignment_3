@@ -35,7 +35,7 @@ type Options struct {
 	Silent  bool    `long:"silent" description:"Hide welcome logo and other output [ shown by default ]"`
 	Chat    bool    `long:"chat" description:"Chat with user in interactive mode instead of compute over static prompt"`
 	Dir     string  `long:"dir" description:"Directory used to download .bin model specified with --model parameter [ current by default ]"`
-	Profile bool    `long:"profile" description:"Profe CPU performance while running and store results to cpu.pprof file"`
+	Profile bool    `long:"profile" description:"Profile CPU performance while running and store results to cpu.pprof file"`
 	UseAVX  bool    `long:"avx" description:"Enable x64 AVX2 optimizations for Intel and AMD machines"`
 	UseNEON bool    `long:"neon" description:"Enable ARM NEON optimizations for Apple and ARM machines"`
 }

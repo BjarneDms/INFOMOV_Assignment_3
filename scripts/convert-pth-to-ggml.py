@@ -39,12 +39,13 @@ WTYPES = {
     1: GGML_TYPE_F16,
     2: GGML_TYPE_Q4_0,
     3: GGML_TYPE_Q4_1,
+    4: GGML_TYPE_I8,
 }
 
 GGML_BLCK_SIZE = {
     GGML_TYPE_Q4_0:  QK,
     GGML_TYPE_Q4_1:  QK,
-    GGML_TYPE_I8:    1,
+    GGML_TYPE_I8:    QK,
     GGML_TYPE_I16:   1,
     GGML_TYPE_I32:   1,
     GGML_TYPE_F16:   1,
@@ -54,7 +55,7 @@ GGML_BLCK_SIZE = {
 GGML_TYPE_SIZE = {
     GGML_TYPE_Q4_0: 4   + QK//2,
     GGML_TYPE_Q4_1: 4*2 + QK//2,
-    GGML_TYPE_I8:   1,
+    GGML_TYPE_I8:   4 + QK,
     GGML_TYPE_I16:  2,
     GGML_TYPE_I32:  4,
     GGML_TYPE_F16:  2,
@@ -77,12 +78,12 @@ def ggml_nbytes(shape, ftype):
 def parse_args():
     parser = argparse.ArgumentParser(description='Convert a LLaMA model checkpoint to a ggml compatible file')
     parser.add_argument('dir_model',  help='directory containing the model checkpoint')
-    parser.add_argument('ftype',      help='file type (0: float32, 1: float16)', type=int, choices=[0, 1], default=1)
+    parser.add_argument('ftype',      help='file type (0: float32, 1: float16, 4: int8)', type=int, choices=[0, 1, 4], default=1)
     parser.add_argument('vocab_only', help='only write vocab to file', type=int, default=0, nargs='?')
     return parser.parse_args()
 
 def get_n_parts(dim):
-    mappings = {4096: 1, 5120: 2, 6656: 4, 8192: 8}
+    mappings = {4096: 2, 5120: 2, 6656: 4, 8192: 8}
     n_parts = mappings.get(dim)
     if n_parts is None:
         print(f"Invalid dim: {dim}")
@@ -97,8 +98,8 @@ def load_hparams_and_tokenizer(dir_model):
     # When `dir_model` is a symlink, f"{dir_model}/../tokenizer.model" would not be found.
     # Let's use the model's parent dir directly.
     model_parent_dir = os.path.dirname(os.path.normpath(dir_model))
-    fname_hparams = f"{dir_model}/params.json"
-    fname_tokenizer = f"{model_parent_dir}/tokenizer.model"
+    fname_hparams = f"{dir_model}/config.json"
+    fname_tokenizer = f"{dir_model}/tokenizer.model"
     with open(fname_hparams, "r") as f:
         hparams = json.load(f)
         print(hparams)
@@ -107,12 +108,16 @@ def load_hparams_and_tokenizer(dir_model):
     return hparams, tokenizer
 
 def write_header(fout, hparams, ftype):
-    keys = ["vocab_size", "dim", "multiple_of", "n_heads", "n_layers"]
+    keys = ["vocab_size", "hidden_size", "multiple_of", "num_attention_heads", "num_hidden_layers"]
+
+    # GGML file format convention for ftype values.
+    # 0: F32, 1: F16, 7: Q8_0
+
     values = [
         0x67676a74,  # magic: ggjt in hex
         1, # file version
         *[hparams[key] for key in keys],
-        hparams["dim"] // hparams["n_heads"],  # rot (obsolete)
+        hparams["hidden_size"] // hparams["num_attention_heads"],  # rot (obsolete)
         ftype
     ]
     fout.write(struct.pack("i" * len(values), *values))
@@ -149,12 +154,46 @@ def process_and_write_variables(fout, model, ftype, part_id, n_parts):
 
         print(f"Processing variable: {name} with shape: {partshape} and type: {datao.dtype}")
 
-        # coerce single-dimensional tensors from float16 to float32
-        ftype_cur = 1
-        if ftype == 0 or n_dims == 1:
+        # quantize processor
+        # ftype_cur holds the user-specified type key, which is used for lookups in WTYPES
+        ftype_cur = ftype
+        if ftype == 4:
+            if n_dims > 1 and "norm" not in name:
+                print("  Quantizing to int8")
+                data = data.astype(np.float16)
+                nelements = data.size
+                if nelements % QK != 0:
+                    print(f"Error: Number of elements {nelements} is not divisible by {QK} for tensor {name}")
+                    sys.exit(1)
+
+                nblocks = nelements // QK
+                d = data.reshape((nblocks, QK))
+
+                scales = np.max(np.abs(d), axis=1) / 127.0
+                scales = scales.astype(np.float32)
+                scales[scales == 0] = 1.0
+
+                qs = np.round(d / scales[:, np.newaxis]).astype(np.int8)
+
+                packed_data = np.zeros(nblocks, dtype=[('d', np.float32), ('q', np.int8, QK)])
+                packed_data['d'] = scales
+                packed_data['q'] = qs
+
+                data = packed_data
+                ftype_cur = 4 # use key for GGML_TYPE_I8
+            else:
+                # convert 1D tensors and norm layers to float32
+                data = data.astype(np.float32)
+                ftype_cur = 0 # use key for GGML_TYPE_F32
+        elif ftype == 0 or n_dims == 1:
             print("  Converting to float32")
             data = data.astype(np.float32)
             ftype_cur = 0
+        else:
+            print("  Converting to float16")
+            data = data.astype(np.float16)
+            ftype_cur = 1
+
         blck_size = GGML_BLCK_SIZE[WTYPES[ftype_cur]]
         type_size = GGML_TYPE_SIZE[WTYPES[ftype_cur]]
 
@@ -235,24 +274,24 @@ def main():
     args = parse_args()
     dir_model = args.dir_model
     ftype = args.ftype
-    ftype_str = ["f32", "f16"]
+    ftype_str_map = {0: "f32", 1: "f16", 4: "i8"}
     hparams, tokenizer = load_hparams_and_tokenizer(dir_model)
 
     print(args)
 
-    # if only writing vocab to file
-    if args.vocab_only:
-        fname_model = f"{dir_model}/consolidated.00.pth"
-        fname_out = f"{dir_model}/ggml-vocab.bin"
-        print(f"Extracting only the vocab from '{fname_model}'\n")
-        with open(fname_out, "wb") as fout:
-            write_header(fout, hparams, ftype)
-            write_tokens(fout, tokenizer)
-        print(f"Done. Output file: {fname_out}\n")
-        return
+#     # if only writing vocab to file
+#     if args.vocab_only:
+#         fname_model = f"{dir_model}/consolidated.00.pth"
+#         fname_out = f"{dir_model}/ggml-vocab.bin"
+#         print(f"Extracting only the vocab from '{fname_model}'\n")
+#         with open(fname_out, "wb") as fout:
+#             write_header(fout, hparams, ftype)
+#             write_tokens(fout, tokenizer)
+#         print(f"Done. Output file: {fname_out}\n")
+#         return
 
-    n_parts = get_n_parts(hparams["dim"])
-    fname_out = f"{dir_model}/ggml-model-{ftype_str[ftype]}.bin"
+    n_parts = get_n_parts(hparams["hidden_size"])
+    fname_out = f"{dir_model}/ggml-model-{ftype_str_map[ftype]}.bin"
 
     # we output a single file for ggml
     with open(fname_out, "wb") as fout:
@@ -263,7 +302,7 @@ def main():
         for part_id in range(n_parts):
             fout.seek(offset_of_tensors)
             print(f"Processing part {part_id+1} of {n_parts}\n")
-            fname_model = f"{dir_model}/consolidated.0{part_id}.pth"
+            fname_model = f"{dir_model}/pytorch_model-{(part_id+1):05d}-of-{n_parts:05d}.bin"
             model = torch.load(fname_model, map_location="cpu")
             process_and_write_variables(fout, model, ftype, part_id, n_parts)
             del model
