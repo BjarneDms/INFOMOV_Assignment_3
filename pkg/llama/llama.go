@@ -5,8 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"unsafe"
-
 	//"io"
 	"math"
 	"math/rand"
@@ -94,7 +92,7 @@ type Context struct {
 
 // NewContext creates a new context.
 func NewContext(model *Model, params *ModelParams) *Context {
-	dt := ml.TYPE_F32
+	dt := ml.TYPE_I8
 
 	size := model.hparams.embdSize * model.hparams.layersCount * params.CtxSize
 	return &Context{
@@ -242,7 +240,7 @@ func Eval(
 	}
 
 	// Initialize the embd tensor with the tokensFloat32 data
-	embd := ml.NewTensor1D(ctx0, ml.TYPE_I8, 0) // Data will be appended in blocks
+	embd := ml.NewTensor1D(ctx0, ml.TYPE_I8, uint32(len(tokens))) // Data will be appended in blocks
 	ml.HydrateTensorFromUI32(embd, tokens)
 
 	inpL := ml.GetRows(ctx0, model.tokEmbeddings, embd)
@@ -287,7 +285,7 @@ func Eval(
 					ml.Rope(ctx0,
 						ml.Copy(ctx0,
 							Qcur,
-							ml.NewTensor3D(ctx0, ml.TYPE_F32, embdSize/headsCount, headsCount, N)), // Reusable OK
+							ml.NewTensor3D(ctx0, ml.TYPE_I8, embdSize/headsCount, headsCount, N)), // Reusable OK
 						pastCount, rotCount, 0),
 					0, 2, 1, 3)
 
@@ -324,7 +322,7 @@ func Eval(
 							ml.View1D(ctx0, kvSelf.V, (pastCount+N)*embdSize, il*ctxSize*embdSize),
 							embdSize/headsCount, headsCount, pastCount+N),
 						1, 2, 0, 3),
-					ml.NewTensor3D(ctx0, ml.TYPE_F32 /* kv_self.v->type */, pastCount+N, embdSize/headsCount, headsCount))
+					ml.NewTensor3D(ctx0, ml.TYPE_I8 /* kv_self.v->type */, pastCount+N, embdSize/headsCount, headsCount))
 
 			// KQV = transpose(V) * KQ_soft_max
 			KQV := ml.MulMat(ctx0, VTrans, KQSoftMax)
@@ -335,7 +333,7 @@ func Eval(
 			// cur = KQV_merged.contiguous().view(n_embd, N)
 			cur = ml.Copy(ctx0,
 				KQVMerged,
-				ml.NewTensor2D(ctx0, ml.TYPE_F32, embdSize, N)) // Reusable OK
+				ml.NewTensor2D(ctx0, ml.TYPE_I8, embdSize, N)) // Reusable OK
 
 			// projection (no bias)
 			cur = ml.MulMat(ctx0, model.layers[il].wo, cur)
@@ -434,6 +432,9 @@ func Eval(
 // printTensor prints a tensor
 func printTensor(tensor *ml.Tensor, name string) {
 	var dt string
+	if tensor.Type == ml.TYPE_I8 {
+		dt = "INT8"
+	}
 	if tensor.Type == ml.TYPE_F16 {
 		dt = "FP16"
 	}
@@ -723,13 +724,13 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		return nil, nil, err
 	}
 
-	fmt.Printf("Got GGUF file version: %d\n", g.Version)
+	//fmt.Printf("Got GGUF file version: %d\n", g.Version)
 
-	arch, _ := g.Metadata.String("general.architecture")
-	fmt.Printf(arch)
+	//arch, _ := g.Metadata.String("general.architecture")
+	//fmt.Printf(arch)
 
-	contextLength, _ := g.Metadata.Int("llama.context_length")
-	fmt.Printf("Context length: %d\n", contextLength)
+	//contextLength, _ := g.Metadata.Int("llama.context_length")
+	//fmt.Printf("Context length: %d\n", contextLength)
 
 	// --- load hparams
 
@@ -900,7 +901,7 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 
 				// Read scalar
 				scalar := binary.LittleEndian.Uint16(scalarBytes)
-				tensor.Scalars[i] = *(*float16.Float16)(unsafe.Pointer(&scalar))
+				tensor.Scalars[i] = *(*float16.Float16)(&scalar)
 
 				// Read weights
 				for j := uint32(0); j < blockSize; j++ {

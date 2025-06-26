@@ -305,7 +305,7 @@ func MulMat(ctx *Context, a, b *Tensor) *Tensor {
 		isNode = true
 	}
 
-	result := NewTensor(ctx, TYPE_F32, min32(a.Dims, b.Dims), a.NE[1], b.NE[1], a.NE[2], b.NE[3], nil, nil) // Reusable OK
+	result := NewTensor(ctx, TYPE_I8, min32(a.Dims, b.Dims), a.NE[1], b.NE[1], a.NE[2], b.NE[3], nil, nil) // Reusable OK
 
 	result.op = OP_MUL_MAT
 	result.src0 = a
@@ -640,7 +640,7 @@ func View1D(ctx *Context, a *Tensor, ne0 uint32, offset uint32) *Tensor {
 	////	os.Exit(1)
 	////}
 
-	scalar := a.Scalars[offset/32:]
+	scalar := a.Scalars[offset/BLCK_SIZE[a.Type]:]
 	slice := a.Data[offset:]
 	result := NewTensor(ctx, a.Type, 1, ne0, 1, 1, 1, scalar, slice)
 
@@ -797,9 +797,9 @@ func HydrateTensorFromFP32(t *Tensor, values []float32) {
 }
 
 func HydrateTensorFromUI32(t *Tensor, values []uint32) {
-	blockSize := 32
-	for i := 0; i < len(values); i += blockSize {
-		end := i + blockSize
+	blockSize := BLCK_SIZE[t.Type]
+	for i := 0; i < len(values); i += int(blockSize) {
+		end := i + int(blockSize)
 		if end > len(values) {
 			end = len(values)
 		}
@@ -837,25 +837,39 @@ func NewTensor(ctx *Context, dt DType, dims uint32, ne0, ne1, ne2, ne3 uint32, s
 
 	////ggml_assert_aligned(result);
 
-	if scalars == nil {
-		total := float32(math.Ceil(float64(ne0*ne1*ne2*ne3) / 32))
-		fmt.Println(total)
-		if total == 0 {
-			total = 1
-		}
-		scalars = make([]float16.Float16, float16.Float16(total), float16.Float16(total))
+	dataLength := uint32(0)
+	if data == nil {
+		dataLength = ne0 * ne1 * ne2 * ne3
+		data = make([]int8, dataLength, dataLength)
 	}
 
-	if data == nil {
-		total := ne0 * ne1 * ne2 * ne3
-		data = make([]int8, total, total)
+	if scalars == nil {
+		scalarLength := uint32(math.Ceil(float64(dataLength) / float64(BLCK_SIZE[dt])))
+		scalars = make([]float16.Float16, scalarLength, scalarLength)
 	}
+
+	//if len(scalars) == 0 || (len(data)/len(scalars)) != 32 {
+	//	fmt.Println(ne0)
+	//	fmt.Println(ne1)
+	//	fmt.Println(ne2)
+	//	fmt.Println(ne3)
+	//	fmt.Println("Invalid format . scalars for . values", len(scalars), len(data))
+	//	pc, file, line, ok := runtime.Caller(2)
+	//	if !ok {
+	//		fmt.Println("Could not get caller info")
+	//		os.Exit(0)
+	//	}
+	//
+	//	fn := runtime.FuncForPC(pc)
+	//	fmt.Printf("Called from %s:%d (%s)\n", file, line, fn.Name())
+	//	os.Exit(0)
+	//}
 
 	return &Tensor{
 		Type:    dt,
 		Dims:    dims,
 		NE:      [4]uint32{ne0, ne1, ne2, ne3},
-		NB:      [4]uint32{4, ne0 * 4, ne0 * ne1 * 4, ne0 * ne1 * ne2 * 4},
+		NB:      [4]uint32{TYPE_SIZE[dt], ne0 * TYPE_SIZE[dt], ne0 * ne1 * TYPE_SIZE[dt], ne0 * ne1 * ne2 * TYPE_SIZE[dt]},
 		op:      OP_NONE,
 		Scalars: scalars,
 		Data:    data,
@@ -1597,6 +1611,9 @@ func GraphCompute(ctx *Context, graph *Graph) {
 		}
 	}
 
+	//fmt.Println(graph.NodesCount)
+	// 1253
+
 	for i := uint32(0); i < graph.NodesCount; i++ {
 
 		node := graph.Nodes[i]
@@ -1618,6 +1635,9 @@ func GraphCompute(ctx *Context, graph *Graph) {
 		params.Type = TASK_COMPUTE
 		ComputeForward(ctx, graph, params, node)
 
+		if (graph.NodesCount % 1) == 0 {
+			fmt.Println("Did forward operation... Now at: Node", i, "with", i/graph.NodesCount*100, "%", node.op)
+		}
 		// --- FINALIZE
 
 		params.Type = TASK_FINALIZE
@@ -1806,12 +1826,10 @@ func VecCopyFP32(n uint32, y, x []float32) {
 	}
 }
 
-func VecCopyI8(n uint32, scalarX, scalarY []float16.Float16, y, x []int8) {
-	for i := uint32(0); i <= (n / 32); i++ {
-		scalarY[i] = scalarX[i]
-	}
+func VecCopyI8(scalary float16.Float16, y []int8, scalarY float16.Float16, x []int8) {
+	scalarY = scalarY
 
-	for i := uint32(0); i < n; i++ {
+	for i := 0; i < len(x); i++ {
 		y[i] = x[i]
 	}
 }
@@ -1828,39 +1846,23 @@ func ComputeForwardGetRows(params *ComputeParams, src0, src1, dst *Tensor) {
 	nc := src0.NE[0]
 	nr := src1.Nelements()
 
-	////assert( dst->ne[0] == nc);
-	////assert( dst->ne[1] == nr);
-	////assert(src0->nb[0] == sizeof(float));
-
-	if dst.NE[0] != nc || dst.NE[1] != nr || src0.NB[0] != TYPE_SIZE[TYPE_F32] /*TYPE_SIZE[TYPE_I32]*/ {
+	fmt.Println(dst.NE[0], nc)
+	fmt.Println(dst.NE[1], nr)
+	fmt.Println(src0.NB[0], 4)
+	if dst.NE[0] != nc || dst.NE[1] != nr || src0.NB[0] != TYPE_SIZE[TYPE_I8] {
 		fmt.Printf("[HALT]ComputeForwardGetRows : wrong dimensions!")
 		os.Exit(1)
 	}
 
-	// FIXME Speed-up
-	////for row := uint32(0); row < nr; row++ {
-	////	for column := uint32(0); column < nc; column++ {
-	////		(*dst.Data)[row*nr+column] = (*src0.Data)[row*nr+column]
-	////	}
-	////}
+	numberOfChunks := uint32(math.Ceil(float64(nr) / 32))
 
-	for i := uint32(0); i < nr; i++ {
-		r := uint32(src1.Data[i])
+	for c := uint32(0); c < numberOfChunks; c++ {
 
-		////ggml_vec_cpy_f32(nc,
-		////        (float *) ((char *)  dst->data + i*dst->nb[1]),
-		////        (float *) ((char *) src0->data + r*src0->nb[1]));
-
-		// FIXME ASAP and double check!
-		// VecCopyFP32(nc, (*dst.Data)[i*dst.NE[0]:], (*src0.Data)[uint32(r)*src0.NE[0]:])
-		// VecCopyFP32(nc, dst.Data[i*dst.NB[1]/4:], src0.Data[r*src0.NB[1]/4:])
-		//VecCopyFP32(nc, dst.Data[i*dst.NE[0]:], src0.Data[r*src0.NE[0]:]) // TODO copy()
 		VecCopyI8(
-			nc,
-			dst.Scalars[i*dst.NE[0]/32:],
-			dst.Scalars[i*dst.NE[0]/32:],
-			dst.Data[i*dst.NE[0]:],
-			src0.Data[r*src0.NE[0]:],
+			dst.Scalars[c],
+			dst.Data[c*32:(c+1)*32],
+			src0.Scalars[c],
+			src0.Data[c*32:(c+1)*32],
 		) // TODO copy()
 	}
 }
@@ -1977,57 +1979,54 @@ func VecScaleI8(scalarY float16.Float16, v float16.Float16) {
 // ggml_compute_forward_repeat
 func ComputeForwardRepeatI8(params *ComputeParams, src0, dst *Tensor) {
 
-	////assert(params->ith == 0);
-	////assert(ggml_can_repeat(src0, dst));
+	// --- Repeat Quantized Data (int8) ---
+	// This part remains the same as it would for float32 scalars.
+	nSrcElements := src0.Nelements()
+	nDstElements := dst.Nelements()
+	repeats := nDstElements / nSrcElements
 
-	if params.Type == TASK_INIT || params.Type == TASK_FINALIZE {
-		return
+	srcData := src0.Data[:nSrcElements]
+	dstData := dst.Data[:nDstElements]
+
+	for i := uint32(0); i < repeats; i++ {
+		copy(dstData[i*nSrcElements:], srcData)
 	}
 
-	// TODO: implement support for rank > 2 tensors
-	////assert(src0->ne[2] == 1);
-	////assert(src0->ne[3] == 1);
-	////assert( dst->ne[2] == 1);
-	////assert( dst->ne[3] == 1);
+	// --- Repeat Quantization Scalars (float16) ---
+	// The original function would work with float32 scalars. This version is
+	// adapted for float16 scalars. For performance, we avoid per-element conversion
+	// and instead reinterpret the memory of the slice.
+	blockSize := BLCK_SIZE[TYPE_I8]
+	nSrcBlocks := nSrcElements / blockSize
+	nDstBlocks := nDstElements / blockSize
 
-	nc := dst.NE[0]
-	nr := dst.NE[1]
-	nc0 := src0.NE[0]
-	nr0 := src0.NE[1]
-	ncr := nc / nc0 // guaranteed to be an integer due to the check in ggml_can_repeat
-	nrr := nr / nr0 // guaranteed to be an integer due to the check in ggml_can_repeat
-
-	// TODO: support for transposed / permuted tensors
-	////assert( dst->nb[0] == sizeof(float));
-	////assert(src0->nb[0] == sizeof(float));
-
-	// TODO: maybe this is not optimal?
-	for i := uint32(0); i < nrr; i++ {
-		for j := uint32(0); j < ncr; j++ {
-			for k := uint32(0); k < nr0; k++ {
-
-				////ggml_vec_cpy_f32(nc0,
-				////(float *) ((char *)  dst->data + (i*nr0 + k)*( dst->nb[1]) + j*nc0*( dst->nb[0])),
-				////(float *) ((char *) src0->data + (        k)*(src0->nb[1])));
-
-				VecCopyI8(
-					nc0,
-					dst.Scalars[(i*nr0+k)*dst.NB[1]/4+j*nc0*dst.NB[0]/4/32:],
-					src0.Scalars[k*src0.NB[1]/4/32:],
-					dst.Data[(i*nr0+k)*dst.NB[1]/4+j*nc0*dst.NB[0]/4:],
-					src0.Data[k*src0.NB[1]/4:],
-				)
-
-				//VecCopyFP32(nc0,
-				//	dst.Data[(i*nr0+k)*dst.NB[1]/4+j*nc0*dst.NB[0]/4:],
-				//	src0.Data[k*src0.NB[1]/4:])
-			}
-		}
+	if nSrcBlocks == 0 {
+		return // Nothing to repeat
 	}
+	scalarRepeats := nDstBlocks / nSrcBlocks
 
-	if DEBUG {
-		printTensor(src0, "REPEAT SRC0")
-		printTensor(dst, "REPEAT DST")
+	// To handle float16 scalars efficiently without changing the Tensor struct,
+	// we reinterpret the []float32 slices as []float16.Float16 slices.
+	// A float32 is 4 bytes, while a float16 is 2 bytes. We assume that the
+	// `Scalars` slice was allocated with enough capacity to hold the required
+	// number of float16 values.
+	var srcScalarsF16 []float16.Float16
+	srcHeader := (*reflect.SliceHeader)(unsafe.Pointer(&src0.Scalars))
+	srcF16Header := (*reflect.SliceHeader)(unsafe.Pointer(&srcScalarsF16))
+	srcF16Header.Data = srcHeader.Data
+	srcF16Header.Len = int(nSrcBlocks)
+	srcF16Header.Cap = int(nSrcBlocks)
+
+	var dstScalarsF16 []float16.Float16
+	dstHeader := (*reflect.SliceHeader)(unsafe.Pointer(&dst.Scalars))
+	dstF16Header := (*reflect.SliceHeader)(unsafe.Pointer(&dstScalarsF16))
+	dstF16Header.Data = dstHeader.Data
+	dstF16Header.Len = int(nDstBlocks)
+	dstF16Header.Cap = int(nDstBlocks)
+
+	// Now copy the float16 scalars in bulk
+	for i := uint32(0); i < scalarRepeats; i++ {
+		copy(dstScalarsF16[i*nSrcBlocks:], srcScalarsF16)
 	}
 }
 
@@ -2037,10 +2036,17 @@ func VecMulFP32(n uint32, z, x, y []float32) {
 	}
 }
 
-func VecMulI8(scalarZ *float16.Float16, z []int8, scalarX float16.Float16, x []int8, scalarY float16.Float16, y []int8) {
-	dstF32 := make([]float16.Float16, 32)
+func VecMulI8(scalarZ float16.Float16, z []int8, scalarX float16.Float16, x []int8, scalarY float16.Float16, y []int8) {
+	if len(x) != len(y) {
+		fmt.Printf("[HALT]VecMulI8 : x and y must have the same length!")
+		os.Exit(1)
+	}
 
-	for i := uint32(0); i < uint32(len(x)); i++ {
+	length := len(x)
+
+	dstF32 := make([]float16.Float16, length)
+
+	for i := uint32(0); i < uint32(length); i++ {
 		dstF32[i] = (scalarX * float16.Float16(x[i])) * (scalarY * float16.Float16(y[i]))
 	}
 
@@ -2051,10 +2057,10 @@ func VecMulI8(scalarZ *float16.Float16, z []int8, scalarX float16.Float16, x []i
 		}
 	}
 
-	*scalarZ = maxValue / 127
+	scalarZ = float16.Float16(float32(maxValue) / 127)
 
 	for i, val := range dstF32 {
-		z[i] = int8(val / *scalarZ)
+		z[i] = int8(float32(val) / float32(scalarZ))
 	}
 }
 
@@ -2084,7 +2090,7 @@ func ComputeForwardMulI8(params *ComputeParams, src0, src1, dst *Tensor) {
 		maxNValues := uint32(min(32, int(n-(c*32))))
 
 		VecMulI8(
-			&dst.Scalars[c],
+			dst.Scalars[c],
 			dst.Data[c*32:c*32+maxNValues],
 			src0.Scalars[c],
 			src0.Data[c*32:c*32+maxNValues],
@@ -2173,14 +2179,7 @@ func CheckGraph() {
 // ggml_compute_forward_mul_mat_f32
 func ComputeForwardMulMatI8(params *ComputeParams, src0, src1, dst *Tensor) {
 
-	// This extra check is not needed (moved to control loop)
-	// if params.Type == TASK_INIT || params.Type == TASK_FINALIZE {
-	// 	return
-	// }
-
-	// TODO: Precompute some numbers like ir0..ir1 within main thread and pass them into Job threads?
 	// --- Copy tensor parameters to local vars for compact fitting in CPU cache lines
-
 	ne00 := src0.NE[0]
 	ne01 := src0.NE[1]
 	ne02 := src0.NE[2]
@@ -2188,81 +2187,25 @@ func ComputeForwardMulMatI8(params *ComputeParams, src0, src1, dst *Tensor) {
 
 	ne11 := src1.NE[1]
 
-	nb01 := src0.NB[1]
-	nb02 := src0.NB[2]
-	nb03 := src0.NB[3]
-
-	nb11 := src1.NB[1]
-	nb12 := src1.NB[2]
-	nb13 := src1.NB[3]
-
 	nb0 := dst.NB[0]
 	nb1 := dst.NB[1]
 	nb2 := dst.NB[2]
 	nb3 := dst.NB[3]
+	nb01 := src0.NB[1]
+	nb02 := src0.NB[2]
+	nb03 := src0.NB[3]
+	nb11 := src1.NB[1]
+	nb12 := src1.NB[2]
+	nb13 := src1.NB[3]
 
-	//src0Scalar := unsafe.Pointer(&src0.Scalars[0])
-	//src0Data := unsafe.Pointer(&src0.Data[0])
-	//
-	//src1Scalar := unsafe.Pointer(&src1.Scalars[0])
-	//src1Data := unsafe.Pointer(&src1.Data[0])
-	//
-	//dstScalar := unsafe.Pointer(&dst.Scalars[0])
-	//dstData := unsafe.Pointer(&dst.Data[0])
-
+	// --- Threading logic from original function
 	nr := ne01 * ne02 * ne03                 // total rows in src0
 	dr := (nr + params.nth - 1) / params.nth // rows per thread
 	ir0 := dr * params.ith                   // row range...
 	ir1 := min32(ir0+dr, nr)                 // ...for this thread
 
-	// Optimized math for x64 AVX2 and ARM NEON
-	// Works well both for 2D and 3D tensors (it's possible to remove extra math for 2D matrix)
-
-	//if (params.UseAVX || params.UseNEON) && src0.IsContiguous() && src1.IsContiguous() {
-	//
-	//	srcStride := nb01 // common dimension size between src0 and src1
-	//	dstStride := nb1
-	//
-	//	src0F32 := make([]float32, ir1-ir0)
-	//	src1F32 := make([]float32, ir1-ir0)
-	//	dstF32 := make([]float32, ir1-ir0)
-	//
-	//	for ir := ir0; ir < ir1; ir++ {
-	//
-	//		step3D := ir / ne01
-	//
-	//		src0ScalarPtr := unsafe.Add(src0Scalar, ir*32)
-	//		src0Ptr := unsafe.Add(src0Data, ir*srcStride)
-	//
-	//		src1ScalarPtr := unsafe.Add(src1Scalar, step3D*32)
-	//		src1Ptr := unsafe.Add(src1Data, step3D*nb12)
-	//
-	//		src0F32[ir-ir0] = float32(*src0Ptr) * float32(*src0ScalarPtr)
-	//		src1F32[ir-ir0] = float32(*src1Ptr) * float32(*src1ScalarPtr)
-	//		dstF32[ir-ir0] = float32(0)
-	//
-	//		for ic := uint32(0); ic < ne11; ic++ {
-	//			vdot(
-	//				unsafe.Pointer(&src0F32[ir-ir0]),
-	//				unsafe.Pointer(&src1F32[ir-ir0]),
-	//				uint64(ne00),
-	//				unsafe.Pointer(&dstF32[ir-ir0]),
-	//			)
-	//
-	//			src1Ptr = unsafe.Add(src1Ptr, srcStride)
-	//		}
-	//	}
-	//
-	//	maxValue := dstF32[ir0]
-	//	for _, val := range dstF32[ir0+1 : ir1] {
-	//		if val > maxValue {
-	//			maxValue = val
-	//		}
-	//	}
-	//
-	//	//maxValue * (1.0 / 127)
-	//
-	//} else {
+	// For Q8_0, the block size is 32. Every 32 int8 values have one float16 scalar.
+	const blockSize = 32
 
 	mult := ne02 * ne01
 	for ir := ir0; ir < ir1; ir++ {
@@ -2280,72 +2223,79 @@ func ComputeForwardMulMatI8(params *ComputeParams, src0, src1, dst *Tensor) {
 
 		src0Offset := i01*nb01 + i02*nb02 + i03*nb03
 
-		dstF32 := make([]float16.Float16, ne11)
-
 		for ic := uint32(0); ic < ne11; ic++ {
 
-			//dst.Data[i0*nb0+ic*nb1+i2*nb2+i3*nb3] =
-			//	VecDotFP32(ne00,
-			//		src0.Data[i01*nb01+i02*nb02+i03*nb03:],
-			//		src1.Data[ic*nb11+i12*nb12+i13*nb13:])
-
-			// --- inline VecDotFP32
-
 			src1Offet := ic*nb11 + i02*nb12 + i03*nb13
-			//dstOffset := i01*nb0 + ic*nb1 + i02*nb2 + i03*nb3
+			dstOffset := i01*nb0 + ic*nb1 + i02*nb2 + i03*nb3
 
-			//if params.UseAVX || params.UseNEON {
-			//
-			//	src0Ptr := unsafe.Add(src0Data, src0Offset)
-			//	src1Ptr := unsafe.Add(src1Data, src1Offet)
-			//	dstPtr := unsafe.Add(dstData, dstOffset)
-			//
-			//	vdot(src0Ptr, src1Ptr, uint64(ne00), dstPtr)
-			//
-			//} else
-			//{ // scalar CPU math
+			// Dequantization scalars for the current block
+			src0ScalarPtr := src0.Scalars[src0Offset/4/32]
+			src1ScalarPtr := src1.Scalars[src1Offet/4/32]
 
-			src0ScalarPtr := src0.Scalars[src0Offset/4/32:]
+			// Slices for the int8 data for the current block
 			src0Ptr := src0.Data[src0Offset/4:]
-			src1ScalarPtr := src1.Scalars[src1Offet/4/32:]
 			src1Ptr := src1.Data[src1Offet/4:]
 
-			sum := float16.Float16(0.0)
+			sum := float32(0.0)
 			for i := uint32(0); i < ne00; i++ {
-				sum += (float16.Float16(src0Ptr[i]) * src0ScalarPtr[i/32]) * (float16.Float16(src1Ptr[i]) * src1ScalarPtr[i/32])
+				sum += (float32(src0ScalarPtr) * float32(src0Ptr[i])) * (float32(src1ScalarPtr) * float32(src1Ptr[i]))
 			}
 
-			dstF32[ic] = sum
-			//}
+			dst.Data[dstOffset/4] = int8(sum)
 		}
-
-		chunks := (len(dstF32) / 32) + 1
-		for i := 0; i < chunks; i++ {
-			maxValue := dstF32[i*32]
-			for _, val := range dstF32[i*32 : (i+1)*32] {
-				if val > maxValue {
-					maxValue = val
-				}
-			}
-
-			dst.Scalars[i] = maxValue / 127
-
-			for ic := uint32(i * 32); ic < uint32((i+1)*32); ic++ {
-
-				dstOffset := i01*nb0 + ic*nb1 + i02*nb2 + i03*nb3
-
-				dst.Data[dstOffset/4] = int8(dstF32[ic] * dst.Scalars[i])
-			}
-		}
-
 	}
+
+	// --- Main logic loop, identical structure to original function
+	//mult := ne02 * ne01
+	//for ir := ir0; ir < ir1; ir++ {
+	//	// original GGML indices math
+	//	i03 := ir / mult
+	//	diff := ir - i03*mult
+	//	i02 := diff / ne01
+	//	i01 := diff - i02*ne01
+	//
+	//	src0BaseOffset := i01*nb01 + i02*nb02 + i03*nb03
+	//
+	//	for ic := uint32(0); ic < ne11; ic++ {
+	//		src1BaseOffset := ic*nb11 + i02*nb12 + i03*nb13
+	//		dstOffset := i01*nb0 + ic*nb1 + i02*nb2 + i03*nb3
+	//
+	//		nBlocks := ne00 / blockSize
+	//		sum := float32(0.0)
+	//
+	//		// --- Quantized dot product calculation
+	//		for i := uint32(0); i < nBlocks; i++ {
+	//			blockOffset := i * blockSize
+	//
+	//			// Dequantization scalars for the current block
+	//			d0 := src0.Scalars[(src0BaseOffset+blockOffset)/blockSize].Float32()
+	//			d1 := src1.Scalars[(src1BaseOffset+blockOffset)/blockSize].Float32()
+	//
+	//			// Slices for the int8 data for the current block
+	//			p0 := src0.Data[src0BaseOffset+blockOffset:]
+	//			p1 := src1.Data[src1BaseOffset+blockOffset:]
+	//
+	//			// Calculate dot product for the block of 32 int8 values
+	//			blockSum := int32(0)
+	//			for j := uint32(0); j < blockSize; j++ {
+	//				blockSum += int32(p0[j]) * int32(p1[j])
+	//			}
+	//
+	//			// Accumulate the dequantized sum
+	//			sum += d0 * d1 * float32(blockSum)
+	//		}
+	//
+	//		dst.Data[dstOffset] = int8(math.Round(float64(sum)))
+	//	}
 	//}
+}
 
-	if DEBUG {
-		fmt.Printf("\n\n>>> ComputeForwardMulMatFP32 OUT <<<\n")
-		printTensor(dst, "DST CPU")
+// min32 is a helper function to find the minimum of two uint32 values.
+func min32(a, b uint32) uint32 {
+	if a < b {
+		return a
 	}
-
+	return b
 }
 
 // ggml_compute_forward_view
@@ -2357,142 +2307,97 @@ func ComputeForwardCopy(params *ComputeParams, src0, dst *Tensor) {
 	ComputeForwardDupI8(params, src0, dst)
 }
 
-// ggml_compute_forward_dup_f32
+// ComputeForwardDupQ8 copies a tensor that is stored in Q8_0 layout:
+//
+//   - src0.Data    []int8            – 32 values per block
+//   - src0.Scalars []float16.Float16 – 1 scale per block
+//
+// The destination tensor must have the same Q8_0 type.
+//
+// Thread-parallelism is the same as the FP32 original: each thread copies an
+// exclusive row range, identified by params.ith / params.nth.
 func ComputeForwardDupI8(params *ComputeParams, src0, dst *Tensor) {
 
-	////GGML_ASSERT(params->ith == 0);
-	////GGML_ASSERT(ggml_is_contiguous(dst));
-	////GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
+	blockSize := BLCK_SIZE[src0.Type] // Q8_0 block size
 
 	if !dst.IsContiguous() {
-		fmt.Printf("[HALT] ComputeForwardDupFP32 : [dst] is NOT contiguous!")
+		fmt.Println(dst.Type)
+		fmt.Println(dst.NB[0], dst.NB[1], dst.NB[2], dst.NB[3])
+		fmt.Println(blockSize, dst.Nelements())
+		fmt.Fprintln(os.Stderr, "[HALT] ComputeForwardDupQ8: dst is NOT contiguous")
 		os.Exit(1)
 	}
-
-	if dst.Nelements() != src0.Nelements() {
-		fmt.Printf("[HALT] ComputeForwardDupFP32 : [dst] and [src0] capacities are different!")
+	
+	if src0.Type != TYPE_I8 || dst.Type != TYPE_I8 {
+		fmt.Fprintln(os.Stderr, "[HALT] ComputeForwardDupQ8: tensors must be TYPE_Q8_0")
 		os.Exit(1)
 	}
-
+	if src0.Nelements() != dst.Nelements() {
+		fmt.Fprintln(os.Stderr, "[HALT] ComputeForwardDupQ8: element counts differ")
+		os.Exit(1)
+	}
 	if params.Type == TASK_INIT || params.Type == TASK_FINALIZE {
 		return
 	}
+
+	// ─────────────────────────────────────────────────────────────
+	// Fast path: both tensors are contiguous → just memcpy both blobs
+	// ─────────────────────────────────────────────────────────────
+	if src0.IsContiguous() && dst.IsContiguous() {
+		copy(dst.Data, src0.Data)
+		copy(dst.Scalars, src0.Scalars)
+		return
+	}
+
+	// ─────────────────────────────────────────────────────────────
+	// Generic (non-contiguous) path
+	// ─────────────────────────────────────────────────────────────
 
 	ne00 := src0.NE[0]
 	ne01 := src0.NE[1]
 	ne02 := src0.NE[2]
 	ne03 := src0.NE[3]
 
-	nb00 := src0.NB[0] / 4
-	nb01 := src0.NB[1] / 4
-	nb02 := src0.NB[2] / 4
-	nb03 := src0.NB[3] / 4
+	nb00 := src0.NB[0] // byte-stride for one i00 step
+	nb01 := src0.NB[1]
+	nb02 := src0.NB[2]
+	nb03 := src0.NB[3]
 
-	////if (ggml_is_contiguous(src0) && src0->type == dst->type) {
-	if src0.IsContiguous() && src0.Type == dst.Type {
-		////memcpy(dst->data, src0->data, ggml_nelements(dst) * GGML_TYPE_SIZE[src0->type]);
-		copy(dst.Data, src0.Data)
-		return
-	}
+	// Work split per thread = product of the three outer dims
+	totalRows := ne01 * ne02 * ne03
+	rowsPerTh := (totalRows + params.nth - 1) / params.nth
+	rowStart := rowsPerTh * params.ith
+	rowEnd := min32(rowStart+rowsPerTh, totalRows)
 
-	// --- src0 is NOT contigious
-	// --- supporting only 4-bytes data for [src0] and FP32 for [dst]
+	// Each outer-dimension index triple (i01,i02,i03) defines one “row”.
+	// We convert row index ↦ 3-D indices with the same arithmetic the FP32
+	// version used.
+	for row := rowStart; row < rowEnd; row++ {
 
-	if src0.NB[0] == TYPE_SIZE[TYPE_I8] {
-		if dst.Type == TYPE_I8 {
+		i03 := row / (ne01 * ne02)
+		rest := row - i03*ne01*ne02
+		i02 := rest / ne01
+		i01 := rest - i02*ne01
 
-			id := uint32(0)
-			rs := ne00 * nb00
+		// Base byte offsets of this row in src and dst
+		srcRowOff := i01*nb01 + i02*nb02 + i03*nb03
+		dstRowOff := srcRowOff // identical layout in dst
 
-			for i03 := uint32(0); i03 < ne03; i03++ {
-				for i02 := uint32(0); i02 < ne02; i02++ {
-					for i01 := uint32(0); i01 < ne01; i01++ {
+		// Base block index of this row in the scalar slice
+		// (32 int8 values = 1 block)
+		blocksBeforeRow := (i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00) / blockSize
 
-						////const char * src0_ptr = (char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
-						src0ScalarPtr := src0.Scalars[i01*nb01+i02*nb02+i03*nb03/32 : i01*nb01+i02*nb02+i03*nb03+rs/32]
-						src0Ptr := src0.Data[i01*nb01+i02*nb02+i03*nb03 : i01*nb01+i02*nb02+i03*nb03+rs]
-						////char * dst_ptr = (char *) dst->data + id*rs;
-						dstScalarPtr := dst.Scalars[id*rs/32 : id*rs+rs/32]
-						dstPtr := dst.Data[id*rs : id*rs+rs]
-						////memcpy(dst_ptr, src0_ptr, rs);
-						copy(dstScalarPtr, src0ScalarPtr)
-						copy(dstPtr, src0Ptr)
+		for i00 := uint32(0); i00 < ne00; i00 += blockSize {
 
-						id++
-					}
-				}
-			}
-			////} else if (dst->type == GGML_TYPE_F16) {
-			////    int id = 0;
-			////    ggml_fp16_t * dst_ptr = (ggml_fp16_t *) dst->data;
+			// --- copy 32 int8 values -----------------------------------------
+			srcBlockOff := srcRowOff + i00*nb00
+			dstBlockOff := dstRowOff + i00*nb00
+			copy(dst.Data[dstBlockOff:dstBlockOff+blockSize], src0.Data[srcBlockOff:srcBlockOff+blockSize])
 
-			////    for (int i03 = 0; i03 < ne03; i03++) {
-			////        for (int i02 = 0; i02 < ne02; i02++) {
-			////            for (int i01 = 0; i01 < ne01; i01++) {
-			////                for (int i00 = 0; i00 < ne00; i00++) {
-			////                    const float * src0_ptr = (float *) ((char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
-
-			////                    dst_ptr[id] = GGML_FP32_TO_FP16(*src0_ptr);
-			////                    id++;
-			////                }
-			////            }
-			////        }
-			////    }
-		} else {
-			////GGML_ASSERT(false); // TODO: implement
-			fmt.Printf("[HALT] ComputeForwardDupFP32 : not supported tensor type!")
-			os.Exit(1)
+			// --- copy 1 float16 scale ----------------------------------------
+			blkIdx := blocksBeforeRow + i00/blockSize
+			dst.Scalars[blkIdx] = src0.Scalars[blkIdx]
 		}
-	} else {
-
-		fmt.Printf("[HALT] ComputeForwardDupFP32 : not supported tensor type!")
-		os.Exit(1)
-
-		if dst.Type == TYPE_F32 {
-
-			id := 0
-			////dstPtr = (float *) dst->data;
-
-			for i03 := uint32(0); i03 < ne03; i03++ {
-				for i02 := uint32(0); i02 < ne02; i02++ {
-					for i01 := uint32(0); i01 < ne01; i01++ {
-						for i00 := uint32(0); i00 < ne00; i00++ {
-
-							//src0Ptr := src0.Data[i00*nb00/4 + i01*nb01/4 + i02*nb02/4 + i03*nb03/4:]
-							//dstPtr[id] = *src0_ptr;
-
-							dst.Data[id] = src0.Data[i00*nb00+i01*nb01+i02*nb02+i03*nb03]
-
-							id++
-						}
-					}
-				}
-			}
-			////} else if (dst->type == GGML_TYPE_F16) {
-			////    int id = 0;
-			////    ggml_fp16_t * dst_ptr = (ggml_fp16_t *) dst->data;
-
-			////    for (int i03 = 0; i03 < ne03; i03++) {
-			////        for (int i02 = 0; i02 < ne02; i02++) {
-			////            for (int i01 = 0; i01 < ne01; i01++) {
-			////                for (int i00 = 0; i00 < ne00; i00++) {
-			////                    const float * src0_ptr = (float *) ((char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
-
-			////                    dst_ptr[id] = GGML_FP32_TO_FP16(*src0_ptr);
-			////                    id++;
-			////                }
-			////            }
-			////        }
-			////    }
-		} else {
-			////GGML_ASSERT(false) // TODO: implement
-			fmt.Printf("[HALT] ComputeForwardDupFP32 : not supported tensor type!")
-			os.Exit(1)
-		}
-	}
-
-	if DEBUG {
-		fmt.Printf("\n\n>>> ComputeForwardDupFP32 OUT <<<\n")
 	}
 }
 
@@ -2633,14 +2538,14 @@ func ComputeForwardScaleI8(params *ComputeParams, src0, src1, dst *Tensor) {
 	ne := src0.Nelements()
 
 	// chunks per thread
-	numberOfChunks := uint32(math.Ceil(float64(ne) / 32))
-	chunksPerThread := uint32(math.Ceil(float64(numberOfChunks) / float64(nth)))
+	nBlocks := uint32(math.Ceil(float64(ne) / 32))
+	blocksPerThread := uint32(math.Ceil(float64(nBlocks) / float64(nth)))
 
 	//// row range for this thread
 	//ir0 := dr * ith
 	//ir1 := min(int(ir0)+int(dr), int(nr))
 
-	for c := uint32(ith * chunksPerThread); c < ((ith + 1) * chunksPerThread); c++ {
+	for c := uint32(ith * blocksPerThread); c < ((ith + 1) * blocksPerThread); c++ {
 		////ggml_vec_scale_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), v);
 		////VecScaleFP32(nc, (*dst.Data)[i1*dst.NE[0]:], v)
 		VecScaleI8(dst.Scalars[c], sv*float16.Float16(v))
@@ -3037,13 +2942,6 @@ func NewVocab(size uint32) *Vocab {
 }
 
 func min(a, b int) int {
-	if a <= b {
-		return a
-	}
-	return b
-}
-
-func min32(a, b uint32) uint32 {
 	if a <= b {
 		return a
 	}

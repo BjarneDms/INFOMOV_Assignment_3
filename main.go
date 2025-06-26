@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"sync"
 	"time"
 
@@ -41,6 +43,13 @@ type Options struct {
 }
 
 func main() {
+
+	f, err := os.Create("cpu.pprof")
+	if err != nil {
+		log.Fatal(err)
+	}
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
 
 	opts := parseOptions()
 
