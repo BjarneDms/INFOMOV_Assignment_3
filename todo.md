@@ -1,0 +1,16 @@
+Functions to rewrite:
+- ComputeForwardMulMatFP32 *
+- ComputeForwardAddFP32 *
+- ComputeForwardMulFP32 *
+- ComputeForwardRepeatFP32 *
+- ComputeForwardSiluFP32 *
+- ComputeForwardRMSNormFP32
+- ComputeForwardScaleFP32 *
+- ComputeForwardDupFP32 *
+- ComputeForwardReshape *
+- ComputeForwardView *
+- ComputeForwardPermute *
+- ComputeForwardGetRows *
+- ComputeForwardDiagMaskInfFP32 *
+- ComputeForwardSoftMaxFP32 *
+- ComputeForwardRopeFP32 *

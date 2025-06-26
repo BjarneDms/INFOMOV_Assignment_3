@@ -4,15 +4,17 @@ import (
 	"container/ring"
 	"fmt"
 	"io"
+	//"io"
 	"math"
 	"math/rand"
 	"os"
-	"reflect"
+	//"reflect"
 	"runtime"
 	"sort"
 	"time"
-	"unsafe"
+	//"unsafe"
 
+	"github.com/abrander/gguf"
 	//progressbar "github.com/schollz/progressbar/v3"
 	"github.com/mattn/go-colorable"
 	"github.com/mitchellh/colorstring"
@@ -302,7 +304,7 @@ func Eval(
 			KQScaled :=
 				ml.Scale(ctx0,
 					KQ,
-					ml.NewFP32(ctx0, float32(1.0/math.Sqrt(float64(embdSize)/float64(headsCount)))),
+					ml.NewI8(ctx0, float32(1.0/math.Sqrt(float64(embdSize)/float64(headsCount))), 1),
 				)
 
 			// KQ_masked = mask_past(KQ_scaled)
@@ -396,7 +398,7 @@ func Eval(
 			fmt.Println("Error: Index out of bounds during Logits copy")
 			os.Exit(1)
 		}
-		lctx.Logits[i] = inpL.Data[srcIndex]
+		lctx.Logits[i] = inpL.Scalars[srcIndex/32] * float32(inpL.Data[srcIndex])
 	}
 
 	if ml.DEBUG {
@@ -413,7 +415,8 @@ func Eval(
 	if len(lctx.Embedding) > 0 {
 		////memcpy(embedding_out.data(), (float *) ggml_get_data(embeddings) + (n_embd*(N - 1)), sizeof(float)*n_embd);
 		for i := uint32(0); i < embdSize; i++ {
-			lctx.Embedding[i] = embeddings.Data[(embdSize*(N-1))+i]
+			index := (embdSize * (N - 1)) + i
+			lctx.Embedding[i] = embeddings.Scalars[index/32] * float32(embeddings.Data[index])
 		}
 	}
 
@@ -710,66 +713,55 @@ func SampleTopPTopK(
 // func LoadModel(fileName string, params ModelParams, silent bool) (*Context, error) {
 func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *Model, error) {
 
-	file, err := os.Open(fileName)
+	g, err := gguf.OpenFile(fileName)
+
 	if err != nil {
 		return nil, nil, err
 	}
-	defer file.Close()
 
-	// --- check header magic and format version
+	fmt.Printf("Got GGUF file version: %d\n", g.Version)
 
-	magic := readInt(file)
+	arch, _ := g.Metadata.String("general.architecture")
+	fmt.Printf(arch)
 
-	if magic == LLAMA_FILE_MAGIC_UNVERSIONED || magic == LLAMA_FILE_MAGIC_OLD {
-		fmt.Printf("\n[ERROR] Invalid model file '%s'! Too old, regenerate!", fileName)
-		return nil, nil, fmt.Errorf("invalid model file")
-	}
-
-	if magic != LLAMA_FILE_MAGIC {
-		fmt.Printf("\n[ERROR] Invalid model file '%s'! Wrong MAGIC in header", fileName)
-		return nil, nil, fmt.Errorf("invalid model file")
-	}
-
-	version := readInt(file)
-
-	if version != LLAMA_FILE_VERSION {
-		fmt.Printf("\n[ERROR] Invalid model file '%s'! Unsupported version", fileName)
-		return nil, nil, fmt.Errorf("invalid model file")
-	}
+	contextLength, _ := g.Metadata.Int("llama.context_length")
+	fmt.Printf("Context length: %d\n", contextLength)
 
 	// --- load hparams
 
-	vocabSize := readInt(file)   // vocab_size
-	embdSize := readInt(file)    // dim
-	multSize := readInt(file)    // multiple_of
-	headsCount := readInt(file)  // n_heads
-	layersCount := readInt(file) // n_layers
-	rotCount := readInt(file)    // [obsolete] rot = dim // n_heads
-	ftype := readInt(file)       // ftype
-
 	model := NewModel(params)
 
-	model.hparams.vocabSize = vocabSize
-	model.hparams.embdSize = embdSize
-	model.hparams.multSize = multSize
-	model.hparams.headsCount = headsCount
-	model.hparams.layersCount = layersCount
-	model.hparams.rotCount = rotCount
-	model.hparams.ftype = ftype
+	// Populate hparams from the metadata map using standard GGUF keys.
+	model.hparams.vocabSize = g.Metadata["llama.vocab_size"].(uint32)
+	model.hparams.embdSize = g.Metadata["llama.embedding_length"].(uint32)
+	model.hparams.headsCount = g.Metadata["llama.attention.head_count"].(uint32)
+	model.hparams.layersCount = g.Metadata["llama.block_count"].(uint32)
+	model.hparams.rotCount = g.Metadata["llama.rope.dimension_count"].(uint32)
+	// GGUF doesn't have a direct 'ftype' in the same way; it's per-tensor.
+	// You'll determine the type when you read each tensor's info.
+	// For a general model ftype, you might check the type of a major tensor.
+	model.hparams.ftype = 4 // Default or determine from tensor info later
 
-	ffSize := ((2*(4*embdSize)/3 + multSize - 1) / multSize) * multSize
+	// The 'multiple_of' parameter is part of llama.feed_forward_length calculation in GGUF.
+	// We'll use the pre-calculated feed_forward_length directly.
+	ffSize := g.Metadata["llama.feed_forward_length"].(uint32)
 
-	vocab := ml.NewVocab(vocabSize)
+	// In GGUF, context size is also in the metadata.
+	model.hparams.ctxSize = g.Metadata["llama.context_length"].(uint32)
+
+	multSize := 256
+
+	vocab := ml.NewVocab(model.hparams.vocabSize)
 
 	if ml.DEBUG {
-		fmt.Printf("\nvocab  = %d", vocabSize)
-		fmt.Printf("\nembd   = %d", embdSize)
+		fmt.Printf("\nvocab  = %d", model.hparams.vocabSize)
+		fmt.Printf("\nembd   = %d", model.hparams.embdSize)
 		fmt.Printf("\nmult   = %d", multSize)
-		fmt.Printf("\nheads  = %d", headsCount)
-		fmt.Printf("\nlayers = %d", layersCount)
+		fmt.Printf("\nheads  = %d", model.hparams.headsCount)
+		fmt.Printf("\nlayers = %d", model.hparams.layersCount)
 		fmt.Printf("\nff     = %d", ffSize)
-		fmt.Printf("\nrot    = %d", rotCount)
-		fmt.Printf("\nftype    = %d", ftype)
+		fmt.Printf("\nrot    = %d", model.hparams.rotCount)
+		fmt.Printf("\nftype    = %d", model.hparams.ftype)
 	}
 
 	// --- load vocab
@@ -778,35 +770,61 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		Colorize("[magenta][ INIT ][white] Loading vocab...")
 	}
 	/*
-	       // https://pkg.go.dev/github.com/schollz/progressbar/v3#Option
-	   	vocabBar := progressbar.NewOptions(
-	   		int(vocabSize),
-	   		progressbar.OptionFullWidth(),
-	   		//progressbar.OptionSetWidth(40),
-	   		progressbar.OptionEnableColorCodes(true),
-	   		progressbar.OptionSetPredictTime(false),
-	   		progressbar.OptionSetElapsedTime(false),
-	   		progressbar.OptionSetDescription("[light_magenta][ INIT ][light_blue] Loading model vocab...  [light_cyan]"),
-	   		progressbar.OptionSetTheme(progressbar.Theme{
-	   			Saucer:        "[light_magenta]▒[reset]",
-	   			SaucerHead:    "[white]▒[reset]",
-	   			SaucerPadding: "[dark_gray]▒[reset]",
-	   			BarStart:      "[dark_gray]║[reset]",
-	   			BarEnd:        "[dark_gray]║[reset]",
-	   		}))
+	     // https://pkg.go.dev/github.com/schollz/progressbar/v3#Option
+	 	vocabBar := progressbar.NewOptions(
+	 		int(vocabSize),
+	 		progressbar.OptionFullWidth(),
+	 		//progressbar.OptionSetWidth(40),
+	 		progressbar.OptionEnableColorCodes(true),
+	 		progressbar.OptionSetPredictTime(false),
+	 		progressbar.OptionSetElapsedTime(false),
+	 		progressbar.OptionSetDescription("[light_magenta][ INIT ][light_blue] Loading model vocab...  [light_cyan]"),
+	 		progressbar.OptionSetTheme(progressbar.Theme{
+	 			Saucer:        "[light_magenta]▒[reset]",
+	 			SaucerHead:    "[white]▒[reset]",
+	 			SaucerPadding: "[dark_gray]▒[reset]",
+	 			BarStart:      "[dark_gray]║[reset]",
+	 			BarEnd:        "[dark_gray]║[reset]",
+	 		}))
 	*/
-	for i := uint32(0); i < vocabSize; i++ {
+	//for i := uint32(0); i < model.hparams.vocabSize; i++ {
+	//
+	//	//if !silent && runtime.GOOS != "windows" && i%100 == 0 {
+	//	//	vocabBar.Set(int(i))
+	//	//}
+	//
+	//	length := readInt(file)
+	//	token := readString(file, length)
+	//	score := readFP32(file)
+	//
+	//	vocab.Token2ID[token] = i
+	//	vocab.ID2Token[i] = ml.TokenScore{Token: token, Score: score}
+	//}
 
-		//if !silent && runtime.GOOS != "windows" && i%100 == 0 {
-		//	vocabBar.Set(int(i))
-		//}
+	tokensList, err := gguf.MetaValue[[]string](g.Metadata, "tokenizer.ggml.tokens")
+	if err != nil {
+		fmt.Printf("could not read tokens: %w", err)
+		return nil, nil, fmt.Errorf("could not read tokens: %w", err)
+	}
 
-		length := readInt(file)
-		token := readString(file, length)
-		score := readFP32(file)
+	scoresList, err := gguf.MetaValue[[]float32](g.Metadata, "tokenizer.ggml.scores")
+	if err != nil {
+		fmt.Printf("could not read scores: %w", err)
+		return nil, nil, fmt.Errorf("could not read scores: %w", err)
+	}
 
-		vocab.Token2ID[token] = i
-		vocab.ID2Token[i] = ml.TokenScore{Token: token, Score: score}
+	if len(tokensList) != len(scoresList) {
+		fmt.Printf("token count (%d) does not match score count (%d)", len(tokensList), len(scoresList))
+		return nil, nil, fmt.Errorf("token count (%d) does not match score count (%d)", len(tokensList), len(scoresList))
+	}
+
+	// Fill vocab
+	for i := 0; i < len(tokensList); i++ {
+		token := tokensList[i]
+		score := scoresList[i]
+
+		vocab.Token2ID[token] = uint32(i)
+		vocab.ID2Token[uint32(i)] = ml.TokenScore{Token: token, Score: score}
 	}
 
 	//if !silent && runtime.GOOS != "windows" {
@@ -816,48 +834,49 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 
 	// --- prepare memory for the weights
 	{
-		model.tokEmbeddings = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, vocabSize) // Fixed OK
+		model.tokEmbeddings = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, model.hparams.vocabSize) // Fixed OK
 
-		model.norm = ml.NewTensor1D(nil, ml.DType(ftype), embdSize)                        // Fixed OK
-		model.output = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, vocabSize) // Fixed OK
+		model.norm = ml.NewTensor1D(nil, ml.DType(model.hparams.ftype), model.hparams.embdSize)                                      // Fixed OK
+		model.output = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, model.hparams.vocabSize) // Fixed OK
 
 		// map by name
-		model.tensors["tok_embeddings.weight"] = model.tokEmbeddings
+		model.tensors["token_embd.weight"] = model.tokEmbeddings
 
 		model.tensors["norm.weight"] = model.norm
 		model.tensors["output.weight"] = model.output
 
-		model.layers = make([]Layer, layersCount)
-		for i := uint32(0); i < layersCount; i++ {
+		model.layers = make([]Layer, model.hparams.layersCount)
+		for i := uint32(0); i < model.hparams.layersCount; i++ {
 
-			model.layers[i].attentionNorm = ml.NewTensor1D(nil, ml.DType(ftype), embdSize) // Fixed OK
+			model.layers[i].attentionNorm = ml.NewTensor1D(nil, ml.DType(model.hparams.ftype), model.hparams.embdSize) // Fixed OK
 
-			model.layers[i].wq = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
-			model.layers[i].wk = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
-			model.layers[i].wv = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
-			model.layers[i].wo = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, embdSize) // Fixed OK
+			model.layers[i].wq = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, model.hparams.embdSize) // Fixed OK
+			model.layers[i].wk = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, model.hparams.embdSize) // Fixed OK
+			model.layers[i].wv = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, model.hparams.embdSize) // Fixed OK
+			model.layers[i].wo = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, model.hparams.embdSize) // Fixed OK
 
-			model.layers[i].ffn_norm = ml.NewTensor1D(nil, ml.DType(ftype), embdSize)
+			model.layers[i].ffn_norm = ml.NewTensor1D(nil, ml.DType(model.hparams.ftype), model.hparams.embdSize)
 
-			model.layers[i].w1 = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, ffSize) // Fixed OK
-			model.layers[i].w2 = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, ffSize, embdSize) // Fixed OK
-			model.layers[i].w3 = ml.NewTensor2D(nil, ml.DType(ftype) /*wtype*/, embdSize, ffSize) // Fixed OK
+			model.layers[i].w1 = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, ffSize) // Fixed OK
+			model.layers[i].w2 = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, ffSize, model.hparams.embdSize) // Fixed OK
+			model.layers[i].w3 = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, ffSize) // Fixed OK
 
 			// map by name
-			prefix := fmt.Sprintf("layers.%d.", i)
+			prefix := fmt.Sprintf("blk.%d.", i)
 
-			model.tensors[prefix+"attention_norm.weight"] = model.layers[i].attentionNorm
+			model.tensors[prefix+"attn_norm.weight"] = model.layers[i].attentionNorm
 
-			model.tensors[prefix+"attention.wq.weight"] = model.layers[i].wq
-			model.tensors[prefix+"attention.wk.weight"] = model.layers[i].wk
-			model.tensors[prefix+"attention.wv.weight"] = model.layers[i].wv
-			model.tensors[prefix+"attention.wo.weight"] = model.layers[i].wo
+			model.tensors[prefix+"attn_q.weight"] = model.layers[i].wq
+			model.tensors[prefix+"attn_k.weight"] = model.layers[i].wk
+			model.tensors[prefix+"attn_v.weight"] = model.layers[i].wv
+			model.tensors[prefix+"attn_output.weight"] = model.layers[i].wo
 
 			model.tensors[prefix+"ffn_norm.weight"] = model.layers[i].ffn_norm
 
-			model.tensors[prefix+"feed_forward.w1.weight"] = model.layers[i].w1
-			model.tensors[prefix+"feed_forward.w2.weight"] = model.layers[i].w2
-			model.tensors[prefix+"feed_forward.w3.weight"] = model.layers[i].w3
+			model.tensors[prefix+"ffn_gate.weight"] = model.layers[i].w1
+			model.tensors[prefix+"ffn_up.weight"] = model.layers[i].w2
+			model.tensors[prefix+"ffn_down.weight"] = model.layers[i].w3
+
 		}
 	}
 
@@ -883,25 +902,33 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 			}))
 	*/
 
-	// --- load weights
-	var tensorsCount uint32
-	for {
-		dims := readInt(file)
+	//for _, t := range g.Tensors {
+	//	r, _ := t.Reader()
+	//
+	//	data := make([]byte, t.Size())
+	//
+	//	fmt.Printf(r.Read(data))
+	//}
+
+	for i, tInfo := range g.Tensors {
+		dims := len(tInfo.Dimensions)
 		if dims < 1 || dims > 2 { // TODO Check for EOF
 			break
 		}
 
-		nameLength := readInt(file)
-		shardType := ml.DType(readInt(file))
+		shardType := mapGGUFTypeToDType(tInfo.Type)
 
 		nelements := 1
 		ne := [2]uint32{1, 1}
 		for i := 0; i < int(dims); i++ {
-			ne[i] = readInt(file)
+			ne[i] = uint32(tInfo.Dimensions[i])
 			nelements *= int(ne[i])
 		}
 
-		name := readString(file, nameLength)
+		name := tInfo.Name
+
+		fmt.Println(name)
+
 		tensor, ok := model.tensors[name]
 		if !ok {
 			fmt.Printf("\n[ERROR] Unknown tensor '%s' in model file", name)
@@ -921,54 +948,29 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 			//	typeStr = "FP16"
 			//}
 			memStr := fmt.Sprintf("%dM", nelements*4/1024/1024)
-			fmt.Printf("\n=== LAYER #%d === %s | %s | %s ===", tensorsCount, typeStr, name, memStr)
+			fmt.Printf("\n=== LAYER #%d === %s | %s | %s ===", tInfo.Size(), typeStr, name, memStr)
 		}
 
 		tensorSize := tensor.Nelements()
 
 		// --- All tensors in file are aligned for 32 bytes
 
-		// TODO: Align with one modulo operation
-		alignment := int64(32)
-		offset, _ := file.Seek(0, io.SeekCurrent)
-		for ; offset%alignment != 0; offset++ {
-		}
-		_, err = file.Seek(offset, io.SeekStart)
-		if err != nil {
-			return nil, nil, err
-		}
-
 		// --- Read tensor into memory
 
 		switch shardType {
-		case ml.TYPE_F16:
-			for n := uint32(0); n < tensorSize; n++ {
-				tensor.Data[n] = readFP16ToFP32(file)
-			}
-		case ml.TYPE_F32:
-			var fake []byte
-			fakeHeader := (*reflect.SliceHeader)(unsafe.Pointer(&fake))
-			dataHeader := (*reflect.SliceHeader)(unsafe.Pointer(&tensor.Data))
-
-			fakeHeader.Data = dataHeader.Data
-			fakeHeader.Len = int(tensorSize * 4)
-			fakeHeader.Cap = int(tensorSize * 4)
-
-			if count, err := io.ReadFull(file, fake); err != nil || count != int(tensorSize*4) {
-				fmt.Printf("\n[ERROR] Failed to read BIG FP32 chunk from model!")
-				fmt.Printf("\n[ERROR] COUNT = %d | ERR = %s", count, err.Error())
-				os.Exit(1)
-			}
 		case ml.TYPE_I8:
+			r, _ := tInfo.Reader()
+
 			// Quantized representation: for every 32 values, compute a scalar and int8 representations
 			blockSize := uint32(32)
 			blocksCount := tensorSize / blockSize
 
 			for i := uint32(0); i < blocksCount; i++ {
-				tensor.Scalars[i] = readFP32(file)
+				tensor.Scalars[i] = float32(0)
+				tensor.Scalars[i] = readFP32(r)
 
 				for j := uint32(0); j < blockSize; j++ {
-					tensor.Data[i*blockSize+j] = readInt8(file)
+					tensor.Data[i*blockSize+j] = readInt8(r)
 				}
 			}
 
@@ -978,20 +980,264 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		}
 
 		// TODO: Implement just simple dots increasing count for Windows
-		tensorsCount++
-		if !silent && tensorsCount%10 == 0 {
+		if !silent && i%10 == 0 {
 			Colorize("[light_blue].")
 		}
-		// if !silent && runtime.GOOS != "windows" {
-		// bar.Add(1)
-		// }
 	}
+
+	for _, t := range g.Tensors {
+		r, _ := t.Reader()
+
+		buf := make([]byte, 16) // size you expect
+		_, err := io.ReadFull(r, buf)
+		if err != nil {
+			return nil, nil, err
+		}
+
+	}
+
+	//// --- load weights
+	//var tensorsCount uint32
+	//for {
+	//	dims := readInt(file)
+	//	if dims < 1 || dims > 2 { // TODO Check for EOF
+	//		break
+	//	}
+	//
+	//	nameLength := readInt(file)
+	//	shardType := ml.DType(readInt(file))
+	//
+	//	nelements := 1
+	//	ne := [2]uint32{1, 1}
+	//	for i := 0; i < int(dims); i++ {
+	//		ne[i] = readInt(file)
+	//		nelements *= int(ne[i])
+	//	}
+	//
+	//	name := readString(file, nameLength)
+	//
+	//	fmt.Println(name)
+	//
+	//	tensor, ok := model.tensors[name]
+	//	if !ok {
+	//		fmt.Printf("\n[ERROR] Unknown tensor '%s' in model file", name)
+	//		os.Exit(1)
+	//	}
+	//
+	//	if ml.DEBUG {
+	//		typeStr := "FP32"
+	//
+	//		switch shardType {
+	//		case ml.TYPE_F16:
+	//			typeStr = "FP16"
+	//		case ml.TYPE_I8:
+	//			typeStr = "I8"
+	//		}
+	//		//if shardType == ml.TYPE_F16 {
+	//		//	typeStr = "FP16"
+	//		//}
+	//		memStr := fmt.Sprintf("%dM", nelements*4/1024/1024)
+	//		fmt.Printf("\n=== LAYER #%d === %s | %s | %s ===", tensorsCount, typeStr, name, memStr)
+	//	}
+	//
+	//	tensorSize := tensor.Nelements()
+	//
+	//	// --- All tensors in file are aligned for 32 bytes
+	//
+	//	// TODO: Align with one modulo operation
+	//	alignment := int64(8)
+	//	offset, _ := file.Seek(0, io.SeekCurrent)
+	//	for ; offset%alignment != 0; offset++ {
+	//	}
+	//	_, err = file.Seek(offset, io.SeekStart)
+	//
+	//	if err != nil {
+	//		return nil, nil, err
+	//	}
+	//
+	//	// --- Read tensor into memory
+	//
+	//	switch shardType {
+	//	case ml.TYPE_F16:
+	//		//for n := uint32(0); n < tensorSize; n++ {
+	//		//	tensor.Data[n] = readFP16ToFP32(file)
+	//		//}
+	//	case ml.TYPE_F32:
+	//		var fake []byte
+	//		fakeHeader := (*reflect.SliceHeader)(unsafe.Pointer(&fake))
+	//		dataHeader := (*reflect.SliceHeader)(unsafe.Pointer(&tensor.Data))
+	//
+	//		fakeHeader.Data = dataHeader.Data
+	//		fakeHeader.Len = int(tensorSize * 4)
+	//		fakeHeader.Cap = int(tensorSize * 4)
+	//
+	//		if count, err := io.ReadFull(file, fake); err != nil || count != int(tensorSize*4) {
+	//			fmt.Printf("\n[ERROR] Failed to read BIG FP32 chunk from model!")
+	//			fmt.Printf("\n[ERROR] COUNT = %d | ERR = %s", count, err.Error())
+	//			os.Exit(1)
+	//		}
+	//	case ml.TYPE_I8:
+	//		// Quantized representation: for every 32 values, compute a scalar and int8 representations
+	//		blockSize := uint32(32)
+	//		blocksCount := tensorSize / blockSize
+	//
+	//		for i := uint32(0); i < blocksCount; i++ {
+	//			tensor.Scalars[i] = float32(0)
+	//			tensor.Scalars[i] = readFP32(file)
+	//
+	//			for j := uint32(0); j < blockSize; j++ {
+	//				tensor.Data[i*blockSize+j] = readInt8(file)
+	//			}
+	//		}
+	//
+	//	default:
+	//		fmt.Printf("\n[ERROR] Tensor data type is not supported yet!")
+	//		os.Exit(0)
+	//	}
+	//
+	//	// TODO: Implement just simple dots increasing count for Windows
+	//	tensorsCount++
+	//	if !silent && tensorsCount%10 == 0 {
+	//		Colorize("[light_blue].")
+	//	}
+	//	// if !silent && runtime.GOOS != "windows" {
+	//	// bar.Add(1)
+	//	// }
+	//}
 
 	// if !silent && runtime.GOOS != "windows" {
 	// bar.Finish()
 	// }
 
 	return vocab, model, nil
+	//return nil, nil, nil
+}
+
+//// unpackTensors loads all tensor data from a GGUF file into the Model object.
+//func unpackTensors(g *gguf.Reader, model *Model) error {
+//	model.tensors = make(map[string]*ml.Tensor, len(g.Tensors))
+//
+//	// 1. Read all tensor metadata and data from the GGUF structure
+//	for _, tInfo := range g.Tensors {
+//		// Create a new ml.Tensor to hold the data
+//		tensor := &ml.Tensor{}
+//
+//		// Map GGUF tensor type to internal DType
+//		// This requires knowing the type mapping from your gguf library.
+//		// Example mapping:
+//		tensor.Type = mapGGUFTypeToDType(tInfo.Type)
+//
+//		// Set dimensions
+//		tensor.Dims = uint32(len(tInfo.Dimensions))
+//		for i, dim := range tInfo.Dimensions {
+//			// GGUF dimensions are often reversed, check your library's convention
+//			tensor.NE[i] = uint32(dim)
+//		}
+//
+//		// Calculate strides (NB) for the new tensor
+//		tensor.NB[0] = ml.TYPE_SIZE[tensor.Type]
+//		for i := 1; i < int(tensor.Dims); i++ {
+//			tensor.NB[i] = tensor.NB[i-1] * tensor.NE[i-1] / ml.BLCK_SIZE[tensor.Type]
+//		}
+//
+//		// Read the raw tensor data from the reader
+//		reader, _ := tInfo.Reader()
+//		rawData, err := io.ReadAll(reader)
+//		if err != nil {
+//			return fmt.Errorf("failed to read data for tensor %s: %w", tInfo.Name, err)
+//		}
+//
+//		// Unpack raw data into Scalars and Data fields for quantized types
+//		if isQuantized(tensor.Type) {
+//			unpackQuantizedData(tensor, rawData)
+//		} else {
+//			// For non-quantized types, the raw data is just the data
+//			tensor.Data = int8(rawData)
+//		}
+//
+//		model.tensors[tInfo.Name] = tensor
+//	}
+//
+//	// 2. Assign tensors to their named fields in the model struct
+//	model.tokEmbeddings = model.tensors["token_embd.weight"]
+//	model.norm = model.tensors["output_norm.weight"]
+//	model.output = model.tensors["output.weight"]
+//
+//	// 3. Allocate and populate the layers
+//	model.layers = make([]Layer, model.hparams.layersCount)
+//	for i := uint32(0); i < model.hparams.layersCount; i++ {
+//		layerPrefix := fmt.Sprintf("blk.%d.", i)
+//		model.layers[i] = Layer{
+//			attentionNorm: model.tensors[layerPrefix+"attn_norm.weight"],
+//			wq:            model.tensors[layerPrefix+"attn_q.weight"],
+//			wk:            model.tensors[layerPrefix+"attn_k.weight"],
+//			wv:            model.tensors[layerPrefix+"attn_v.weight"],
+//			wo:            model.tensors[layerPrefix+"attn_output.weight"],
+//			ffn_norm:      model.tensors[layerPrefix+"ffn_norm.weight"],
+//			w1:            model.tensors[layerPrefix+"ffn_gate.weight"],
+//			w2:            model.tensors[layerPrefix+"ffn_down.weight"],
+//			w3:            model.tensors[layerPrefix+"ffn_up.weight"],
+//		}
+//	}
+//
+//	return nil
+//}
+//
+//// unpackQuantizedData separates the raw buffer of a quantized tensor
+//// into its scale and data components.
+//func unpackQuantizedData(tensor *ml.Tensor, rawData []byte) {
+//	ne := tensor.Nelements()
+//	blockSize := ml.BLCK_SIZE[tensor.Type]
+//	typeSize := ml.TYPE_SIZE[tensor.Type]
+//
+//	// Calculate the size of the scale and the quantized data within a block
+//	scaleSize := uint32(4) // Assume float32 scales
+//	if tensor.Type == ml.TYPE_Q4_1 {
+//		scaleSize = 8 // 2x float32 scales for Q4_1
+//	}
+//	quantizedDataSize := typeSize - scaleSize
+//
+//	numBlocks := ne / blockSize
+//
+//	tensor.Scalars = make([]float32, numBlocks)
+//	tensor.Data = make([]int8, numBlocks*quantizedDataSize)
+//
+//	var offset uint32 = 0
+//	for i := uint32(0); i < numBlocks; i++ {
+//		// Read scale(s) for the block
+//		if tensor.Type == ml.TYPE_Q4_1 {
+//			// Two scales for Q4_1
+//			scale1 := binary.LittleEndian.Uint32(rawData[offset : offset+4])
+//			scale2 := binary.LittleEndian.Uint32(rawData[offset+4 : offset+8])
+//			tensor.Scalars[i] = float32(scale1) // This needs proper interpretation
+//			// The second scale might be handled differently
+//			offset += 8
+//		} else {
+//			scale := binary.LittleEndian.Uint32(rawData[offset : offset+4])
+//			tensor.Scalars[i] = float32(scale) // This needs proper interpretation
+//			offset += 4
+//		}
+//
+//		// Copy quantized data for the block
+//		copy(tensor.Data[i*quantizedDataSize:], rawData[offset:offset+quantizedDataSize])
+//		offset += quantizedDataSize
+//	}
+//}
+//
+//// Helper to check if a type is quantized
+//func isQuantized(dtype ml.DType) bool {
+//	return dtype == ml.TYPE_Q4_0 || dtype == ml.TYPE_Q4_1 // Add other quantized types if any
+//}
+
+// mapGGUFTypeToDType converts a GGUF tensor type to the internal ml.DType.
+// This is a placeholder and depends on your gguf library's type definitions.
+func mapGGUFTypeToDType(ggufType gguf.GGML) ml.DType {
+	switch ggufType {
+	case gguf.GgmlQ8_0:
+		return ml.TYPE_I8
+	default:
+		return ml.TYPE_I8 // or handle as an error
+	}
 }
 
 // max returns the maximum of two float32 values
@@ -1011,9 +1257,9 @@ func readInt(file *os.File) uint32 {
 	return uint32(buf[3])<<24 | uint32(buf[2])<<16 | uint32(buf[1])<<8 | uint32(buf[0])
 }
 
-func readInt8(file *os.File) int8 {
+func readInt8(reader io.Reader) int8 {
 	buf := make([]byte, 1)
-	if count, err := file.Read(buf); err != nil || count != 1 {
+	if count, err := reader.Read(buf); err != nil || count != 1 {
 		return 0
 	}
 	return int8(buf[0])
@@ -1040,9 +1286,9 @@ func readFP16ToFP32(file *os.File) float32 {
 }
 
 // readFP32 reads a 32-bit float from the file
-func readFP32(file *os.File) float32 {
+func readFP32(reader io.Reader) float32 {
 	buf := make([]byte, 4)
-	if count, err := file.Read(buf); err != nil || count != 4 {
+	if count, err := reader.Read(buf); err != nil || count != 4 {
 		return 0.0
 	}
 	bits := uint32(buf[3])<<24 | uint32(buf[2])<<16 | uint32(buf[1])<<8 | uint32(buf[0])

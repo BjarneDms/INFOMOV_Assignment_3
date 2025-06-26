@@ -1,8 +1,9 @@
 module github.com/gotzmann/llama.go
 
-go 1.20
+go 1.21
 
 require (
+	github.com/abrander/gguf v0.0.0-20231228004541-3d15a052a17f
 	github.com/gofiber/fiber/v2 v2.44.0
 	github.com/google/uuid v1.3.0
 	github.com/jessevdk/go-flags v1.5.0
