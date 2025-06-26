@@ -1846,9 +1846,6 @@ func ComputeForwardGetRows(params *ComputeParams, src0, src1, dst *Tensor) {
 	nc := src0.NE[0]
 	nr := src1.Nelements()
 
-	fmt.Println(dst.NE[0], nc)
-	fmt.Println(dst.NE[1], nr)
-	fmt.Println(src0.NB[0], 4)
 	if dst.NE[0] != nc || dst.NE[1] != nr || src0.NB[0] != TYPE_SIZE[TYPE_I8] {
 		fmt.Printf("[HALT]ComputeForwardGetRows : wrong dimensions!")
 		os.Exit(1)
@@ -2244,50 +2241,6 @@ func ComputeForwardMulMatI8(params *ComputeParams, src0, src1, dst *Tensor) {
 			dst.Data[dstOffset/4] = int8(sum)
 		}
 	}
-
-	// --- Main logic loop, identical structure to original function
-	//mult := ne02 * ne01
-	//for ir := ir0; ir < ir1; ir++ {
-	//	// original GGML indices math
-	//	i03 := ir / mult
-	//	diff := ir - i03*mult
-	//	i02 := diff / ne01
-	//	i01 := diff - i02*ne01
-	//
-	//	src0BaseOffset := i01*nb01 + i02*nb02 + i03*nb03
-	//
-	//	for ic := uint32(0); ic < ne11; ic++ {
-	//		src1BaseOffset := ic*nb11 + i02*nb12 + i03*nb13
-	//		dstOffset := i01*nb0 + ic*nb1 + i02*nb2 + i03*nb3
-	//
-	//		nBlocks := ne00 / blockSize
-	//		sum := float32(0.0)
-	//
-	//		// --- Quantized dot product calculation
-	//		for i := uint32(0); i < nBlocks; i++ {
-	//			blockOffset := i * blockSize
-	//
-	//			// Dequantization scalars for the current block
-	//			d0 := src0.Scalars[(src0BaseOffset+blockOffset)/blockSize].Float32()
-	//			d1 := src1.Scalars[(src1BaseOffset+blockOffset)/blockSize].Float32()
-	//
-	//			// Slices for the int8 data for the current block
-	//			p0 := src0.Data[src0BaseOffset+blockOffset:]
-	//			p1 := src1.Data[src1BaseOffset+blockOffset:]
-	//
-	//			// Calculate dot product for the block of 32 int8 values
-	//			blockSum := int32(0)
-	//			for j := uint32(0); j < blockSize; j++ {
-	//				blockSum += int32(p0[j]) * int32(p1[j])
-	//			}
-	//
-	//			// Accumulate the dequantized sum
-	//			sum += d0 * d1 * float32(blockSum)
-	//		}
-	//
-	//		dst.Data[dstOffset] = int8(math.Round(float64(sum)))
-	//	}
-	//}
 }
 
 // min32 is a helper function to find the minimum of two uint32 values.
@@ -2327,7 +2280,7 @@ func ComputeForwardDupI8(params *ComputeParams, src0, dst *Tensor) {
 		fmt.Fprintln(os.Stderr, "[HALT] ComputeForwardDupQ8: dst is NOT contiguous")
 		os.Exit(1)
 	}
-	
+
 	if src0.Type != TYPE_I8 || dst.Type != TYPE_I8 {
 		fmt.Fprintln(os.Stderr, "[HALT] ComputeForwardDupQ8: tensors must be TYPE_Q8_0")
 		os.Exit(1)
@@ -2365,7 +2318,7 @@ func ComputeForwardDupI8(params *ComputeParams, src0, dst *Tensor) {
 
 	// Work split per thread = product of the three outer dims
 	totalRows := ne01 * ne02 * ne03
-	rowsPerTh := (totalRows + params.nth - 1) / params.nth
+	rowsPerTh := (totalRows + params.nth - 1) / 1 //params.nth
 	rowStart := rowsPerTh * params.ith
 	rowEnd := min32(rowStart+rowsPerTh, totalRows)
 
