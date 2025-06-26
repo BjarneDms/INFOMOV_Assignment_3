@@ -2,8 +2,11 @@ package llama
 
 import (
 	"container/ring"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"unsafe"
+
 	//"io"
 	"math"
 	"math/rand"
@@ -92,6 +95,7 @@ type Context struct {
 // NewContext creates a new context.
 func NewContext(model *Model, params *ModelParams) *Context {
 	dt := ml.TYPE_F32
+
 	size := model.hparams.embdSize * model.hparams.layersCount * params.CtxSize
 	return &Context{
 		kvSelf: KVCache{
@@ -398,7 +402,7 @@ func Eval(
 			fmt.Println("Error: Index out of bounds during Logits copy")
 			os.Exit(1)
 		}
-		lctx.Logits[i] = inpL.Scalars[srcIndex/32] * float32(inpL.Data[srcIndex])
+		lctx.Logits[i] = float32(inpL.Scalars[srcIndex/32]) * float32(inpL.Data[srcIndex])
 	}
 
 	if ml.DEBUG {
@@ -416,7 +420,7 @@ func Eval(
 		////memcpy(embedding_out.data(), (float *) ggml_get_data(embeddings) + (n_embd*(N - 1)), sizeof(float)*n_embd);
 		for i := uint32(0); i < embdSize; i++ {
 			index := (embdSize * (N - 1)) + i
-			lctx.Embedding[i] = embeddings.Scalars[index/32] * float32(embeddings.Data[index])
+			lctx.Embedding[i] = float32(embeddings.Scalars[index/32]) * float32(embeddings.Data[index])
 		}
 	}
 
@@ -769,37 +773,6 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 	if !silent && runtime.GOOS == "windows" {
 		Colorize("[magenta][ INIT ][white] Loading vocab...")
 	}
-	/*
-	     // https://pkg.go.dev/github.com/schollz/progressbar/v3#Option
-	 	vocabBar := progressbar.NewOptions(
-	 		int(vocabSize),
-	 		progressbar.OptionFullWidth(),
-	 		//progressbar.OptionSetWidth(40),
-	 		progressbar.OptionEnableColorCodes(true),
-	 		progressbar.OptionSetPredictTime(false),
-	 		progressbar.OptionSetElapsedTime(false),
-	 		progressbar.OptionSetDescription("[light_magenta][ INIT ][light_blue] Loading model vocab...  [light_cyan]"),
-	 		progressbar.OptionSetTheme(progressbar.Theme{
-	 			Saucer:        "[light_magenta]▒[reset]",
-	 			SaucerHead:    "[white]▒[reset]",
-	 			SaucerPadding: "[dark_gray]▒[reset]",
-	 			BarStart:      "[dark_gray]║[reset]",
-	 			BarEnd:        "[dark_gray]║[reset]",
-	 		}))
-	*/
-	//for i := uint32(0); i < model.hparams.vocabSize; i++ {
-	//
-	//	//if !silent && runtime.GOOS != "windows" && i%100 == 0 {
-	//	//	vocabBar.Set(int(i))
-	//	//}
-	//
-	//	length := readInt(file)
-	//	token := readString(file, length)
-	//	score := readFP32(file)
-	//
-	//	vocab.Token2ID[token] = i
-	//	vocab.ID2Token[i] = ml.TokenScore{Token: token, Score: score}
-	//}
 
 	tokensList, err := gguf.MetaValue[[]string](g.Metadata, "tokenizer.ggml.tokens")
 	if err != nil {
@@ -827,11 +800,6 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		vocab.ID2Token[uint32(i)] = ml.TokenScore{Token: token, Score: score}
 	}
 
-	//if !silent && runtime.GOOS != "windows" {
-	//	vocabBar.Finish()
-	//	fmt.Printf("\n")
-	//}
-
 	// --- prepare memory for the weights
 	{
 		model.tokEmbeddings = ml.NewTensor2D(nil, ml.DType(model.hparams.ftype) /*wtype*/, model.hparams.embdSize, model.hparams.vocabSize) // Fixed OK
@@ -842,7 +810,7 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		// map by name
 		model.tensors["token_embd.weight"] = model.tokEmbeddings
 
-		model.tensors["norm.weight"] = model.norm
+		model.tensors["output_norm.weight"] = model.norm
 		model.tensors["output.weight"] = model.output
 
 		model.layers = make([]Layer, model.hparams.layersCount)
@@ -884,31 +852,6 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		//Colorize("[magenta][ INIT ][white] Loading model - please wait ...")
 		Colorize("[light_magenta][ INIT ][light_blue] Loading model, please wait ")
 	}
-	/*
-		// https://pkg.go.dev/github.com/schollz/progressbar/v3#Option
-		bar := progressbar.NewOptions(int(layersCount*9),
-			progressbar.OptionFullWidth(),
-			//progressbar.OptionSetWidth(40),
-			progressbar.OptionEnableColorCodes(true),
-			progressbar.OptionSetPredictTime(false),
-			progressbar.OptionSetElapsedTime(false),
-			progressbar.OptionSetDescription("[light_magenta][ INIT ][light_blue] Loading model weights...[light_cyan]"),
-			progressbar.OptionSetTheme(progressbar.Theme{
-				Saucer:        "[light_magenta]▒[reset]",
-				SaucerHead:    "[white]▒[reset]",
-				SaucerPadding: "[dark_gray]▒[reset]",
-				BarStart:      "[dark_gray]║[reset]",
-				BarEnd:        "[dark_gray]║[reset]",
-			}))
-	*/
-
-	//for _, t := range g.Tensors {
-	//	r, _ := t.Reader()
-	//
-	//	data := make([]byte, t.Size())
-	//
-	//	fmt.Printf(r.Read(data))
-	//}
 
 	for i, tInfo := range g.Tensors {
 		dims := len(tInfo.Dimensions)
@@ -920,14 +863,12 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 
 		nelements := 1
 		ne := [2]uint32{1, 1}
-		for i := 0; i < int(dims); i++ {
+		for i := 0; i < dims; i++ {
 			ne[i] = uint32(tInfo.Dimensions[i])
 			nelements *= int(ne[i])
 		}
 
 		name := tInfo.Name
-
-		fmt.Println(name)
 
 		tensor, ok := model.tensors[name]
 		if !ok {
@@ -935,42 +876,35 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 			os.Exit(1)
 		}
 
-		if ml.DEBUG {
-			typeStr := "FP32"
-
-			switch shardType {
-			case ml.TYPE_F16:
-				typeStr = "FP16"
-			case ml.TYPE_I8:
-				typeStr = "I8"
-			}
-			//if shardType == ml.TYPE_F16 {
-			//	typeStr = "FP16"
-			//}
-			memStr := fmt.Sprintf("%dM", nelements*4/1024/1024)
-			fmt.Printf("\n=== LAYER #%d === %s | %s | %s ===", tInfo.Size(), typeStr, name, memStr)
-		}
-
 		tensorSize := tensor.Nelements()
-
-		// --- All tensors in file are aligned for 32 bytes
-
-		// --- Read tensor into memory
 
 		switch shardType {
 		case ml.TYPE_I8:
 			r, _ := tInfo.Reader()
 
-			// Quantized representation: for every 32 values, compute a scalar and int8 representations
 			blockSize := uint32(32)
 			blocksCount := tensorSize / blockSize
+			blockBytes := uint32(2 + 32)
+
+			buf := make([]byte, blockBytes*blocksCount)
+			if _, err := io.ReadFull(r, buf); err != nil {
+				fmt.Printf("\n[ERROR] Error while reading tensor %s", err.Error())
+
+				return nil, nil, err
+			}
 
 			for i := uint32(0); i < blocksCount; i++ {
-				tensor.Scalars[i] = float32(0)
-				tensor.Scalars[i] = readFP32(r)
+				offset := i * blockBytes
+				scalarBytes := buf[offset : offset+2]
+				weightBytes := buf[offset+2 : offset+34]
 
+				// Read scalar
+				scalar := binary.LittleEndian.Uint16(scalarBytes)
+				tensor.Scalars[i] = *(*float16.Float16)(unsafe.Pointer(&scalar))
+
+				// Read weights
 				for j := uint32(0); j < blockSize; j++ {
-					tensor.Data[i*blockSize+j] = readInt8(r)
+					tensor.Data[i*blockSize+j] = int8(weightBytes[j])
 				}
 			}
 
@@ -985,249 +919,8 @@ func LoadModel(fileName string, params *ModelParams, silent bool) (*ml.Vocab, *M
 		}
 	}
 
-	for _, t := range g.Tensors {
-		r, _ := t.Reader()
-
-		buf := make([]byte, 16) // size you expect
-		_, err := io.ReadFull(r, buf)
-		if err != nil {
-			return nil, nil, err
-		}
-
-	}
-
-	//// --- load weights
-	//var tensorsCount uint32
-	//for {
-	//	dims := readInt(file)
-	//	if dims < 1 || dims > 2 { // TODO Check for EOF
-	//		break
-	//	}
-	//
-	//	nameLength := readInt(file)
-	//	shardType := ml.DType(readInt(file))
-	//
-	//	nelements := 1
-	//	ne := [2]uint32{1, 1}
-	//	for i := 0; i < int(dims); i++ {
-	//		ne[i] = readInt(file)
-	//		nelements *= int(ne[i])
-	//	}
-	//
-	//	name := readString(file, nameLength)
-	//
-	//	fmt.Println(name)
-	//
-	//	tensor, ok := model.tensors[name]
-	//	if !ok {
-	//		fmt.Printf("\n[ERROR] Unknown tensor '%s' in model file", name)
-	//		os.Exit(1)
-	//	}
-	//
-	//	if ml.DEBUG {
-	//		typeStr := "FP32"
-	//
-	//		switch shardType {
-	//		case ml.TYPE_F16:
-	//			typeStr = "FP16"
-	//		case ml.TYPE_I8:
-	//			typeStr = "I8"
-	//		}
-	//		//if shardType == ml.TYPE_F16 {
-	//		//	typeStr = "FP16"
-	//		//}
-	//		memStr := fmt.Sprintf("%dM", nelements*4/1024/1024)
-	//		fmt.Printf("\n=== LAYER #%d === %s | %s | %s ===", tensorsCount, typeStr, name, memStr)
-	//	}
-	//
-	//	tensorSize := tensor.Nelements()
-	//
-	//	// --- All tensors in file are aligned for 32 bytes
-	//
-	//	// TODO: Align with one modulo operation
-	//	alignment := int64(8)
-	//	offset, _ := file.Seek(0, io.SeekCurrent)
-	//	for ; offset%alignment != 0; offset++ {
-	//	}
-	//	_, err = file.Seek(offset, io.SeekStart)
-	//
-	//	if err != nil {
-	//		return nil, nil, err
-	//	}
-	//
-	//	// --- Read tensor into memory
-	//
-	//	switch shardType {
-	//	case ml.TYPE_F16:
-	//		//for n := uint32(0); n < tensorSize; n++ {
-	//		//	tensor.Data[n] = readFP16ToFP32(file)
-	//		//}
-	//	case ml.TYPE_F32:
-	//		var fake []byte
-	//		fakeHeader := (*reflect.SliceHeader)(unsafe.Pointer(&fake))
-	//		dataHeader := (*reflect.SliceHeader)(unsafe.Pointer(&tensor.Data))
-	//
-	//		fakeHeader.Data = dataHeader.Data
-	//		fakeHeader.Len = int(tensorSize * 4)
-	//		fakeHeader.Cap = int(tensorSize * 4)
-	//
-	//		if count, err := io.ReadFull(file, fake); err != nil || count != int(tensorSize*4) {
-	//			fmt.Printf("\n[ERROR] Failed to read BIG FP32 chunk from model!")
-	//			fmt.Printf("\n[ERROR] COUNT = %d | ERR = %s", count, err.Error())
-	//			os.Exit(1)
-	//		}
-	//	case ml.TYPE_I8:
-	//		// Quantized representation: for every 32 values, compute a scalar and int8 representations
-	//		blockSize := uint32(32)
-	//		blocksCount := tensorSize / blockSize
-	//
-	//		for i := uint32(0); i < blocksCount; i++ {
-	//			tensor.Scalars[i] = float32(0)
-	//			tensor.Scalars[i] = readFP32(file)
-	//
-	//			for j := uint32(0); j < blockSize; j++ {
-	//				tensor.Data[i*blockSize+j] = readInt8(file)
-	//			}
-	//		}
-	//
-	//	default:
-	//		fmt.Printf("\n[ERROR] Tensor data type is not supported yet!")
-	//		os.Exit(0)
-	//	}
-	//
-	//	// TODO: Implement just simple dots increasing count for Windows
-	//	tensorsCount++
-	//	if !silent && tensorsCount%10 == 0 {
-	//		Colorize("[light_blue].")
-	//	}
-	//	// if !silent && runtime.GOOS != "windows" {
-	//	// bar.Add(1)
-	//	// }
-	//}
-
-	// if !silent && runtime.GOOS != "windows" {
-	// bar.Finish()
-	// }
-
 	return vocab, model, nil
-	//return nil, nil, nil
 }
-
-//// unpackTensors loads all tensor data from a GGUF file into the Model object.
-//func unpackTensors(g *gguf.Reader, model *Model) error {
-//	model.tensors = make(map[string]*ml.Tensor, len(g.Tensors))
-//
-//	// 1. Read all tensor metadata and data from the GGUF structure
-//	for _, tInfo := range g.Tensors {
-//		// Create a new ml.Tensor to hold the data
-//		tensor := &ml.Tensor{}
-//
-//		// Map GGUF tensor type to internal DType
-//		// This requires knowing the type mapping from your gguf library.
-//		// Example mapping:
-//		tensor.Type = mapGGUFTypeToDType(tInfo.Type)
-//
-//		// Set dimensions
-//		tensor.Dims = uint32(len(tInfo.Dimensions))
-//		for i, dim := range tInfo.Dimensions {
-//			// GGUF dimensions are often reversed, check your library's convention
-//			tensor.NE[i] = uint32(dim)
-//		}
-//
-//		// Calculate strides (NB) for the new tensor
-//		tensor.NB[0] = ml.TYPE_SIZE[tensor.Type]
-//		for i := 1; i < int(tensor.Dims); i++ {
-//			tensor.NB[i] = tensor.NB[i-1] * tensor.NE[i-1] / ml.BLCK_SIZE[tensor.Type]
-//		}
-//
-//		// Read the raw tensor data from the reader
-//		reader, _ := tInfo.Reader()
-//		rawData, err := io.ReadAll(reader)
-//		if err != nil {
-//			return fmt.Errorf("failed to read data for tensor %s: %w", tInfo.Name, err)
-//		}
-//
-//		// Unpack raw data into Scalars and Data fields for quantized types
-//		if isQuantized(tensor.Type) {
-//			unpackQuantizedData(tensor, rawData)
-//		} else {
-//			// For non-quantized types, the raw data is just the data
-//			tensor.Data = int8(rawData)
-//		}
-//
-//		model.tensors[tInfo.Name] = tensor
-//	}
-//
-//	// 2. Assign tensors to their named fields in the model struct
-//	model.tokEmbeddings = model.tensors["token_embd.weight"]
-//	model.norm = model.tensors["output_norm.weight"]
-//	model.output = model.tensors["output.weight"]
-//
-//	// 3. Allocate and populate the layers
-//	model.layers = make([]Layer, model.hparams.layersCount)
-//	for i := uint32(0); i < model.hparams.layersCount; i++ {
-//		layerPrefix := fmt.Sprintf("blk.%d.", i)
-//		model.layers[i] = Layer{
-//			attentionNorm: model.tensors[layerPrefix+"attn_norm.weight"],
-//			wq:            model.tensors[layerPrefix+"attn_q.weight"],
-//			wk:            model.tensors[layerPrefix+"attn_k.weight"],
-//			wv:            model.tensors[layerPrefix+"attn_v.weight"],
-//			wo:            model.tensors[layerPrefix+"attn_output.weight"],
-//			ffn_norm:      model.tensors[layerPrefix+"ffn_norm.weight"],
-//			w1:            model.tensors[layerPrefix+"ffn_gate.weight"],
-//			w2:            model.tensors[layerPrefix+"ffn_down.weight"],
-//			w3:            model.tensors[layerPrefix+"ffn_up.weight"],
-//		}
-//	}
-//
-//	return nil
-//}
-//
-//// unpackQuantizedData separates the raw buffer of a quantized tensor
-//// into its scale and data components.
-//func unpackQuantizedData(tensor *ml.Tensor, rawData []byte) {
-//	ne := tensor.Nelements()
-//	blockSize := ml.BLCK_SIZE[tensor.Type]
-//	typeSize := ml.TYPE_SIZE[tensor.Type]
-//
-//	// Calculate the size of the scale and the quantized data within a block
-//	scaleSize := uint32(4) // Assume float32 scales
-//	if tensor.Type == ml.TYPE_Q4_1 {
-//		scaleSize = 8 // 2x float32 scales for Q4_1
-//	}
-//	quantizedDataSize := typeSize - scaleSize
-//
-//	numBlocks := ne / blockSize
-//
-//	tensor.Scalars = make([]float32, numBlocks)
-//	tensor.Data = make([]int8, numBlocks*quantizedDataSize)
-//
-//	var offset uint32 = 0
-//	for i := uint32(0); i < numBlocks; i++ {
-//		// Read scale(s) for the block
-//		if tensor.Type == ml.TYPE_Q4_1 {
-//			// Two scales for Q4_1
-//			scale1 := binary.LittleEndian.Uint32(rawData[offset : offset+4])
-//			scale2 := binary.LittleEndian.Uint32(rawData[offset+4 : offset+8])
-//			tensor.Scalars[i] = float32(scale1) // This needs proper interpretation
-//			// The second scale might be handled differently
-//			offset += 8
-//		} else {
-//			scale := binary.LittleEndian.Uint32(rawData[offset : offset+4])
-//			tensor.Scalars[i] = float32(scale) // This needs proper interpretation
-//			offset += 4
-//		}
-//
-//		// Copy quantized data for the block
-//		copy(tensor.Data[i*quantizedDataSize:], rawData[offset:offset+quantizedDataSize])
-//		offset += quantizedDataSize
-//	}
-//}
-//
-//// Helper to check if a type is quantized
-//func isQuantized(dtype ml.DType) bool {
-//	return dtype == ml.TYPE_Q4_0 || dtype == ml.TYPE_Q4_1 // Add other quantized types if any
-//}
 
 // mapGGUFTypeToDType converts a GGUF tensor type to the internal ml.DType.
 // This is a placeholder and depends on your gguf library's type definitions.

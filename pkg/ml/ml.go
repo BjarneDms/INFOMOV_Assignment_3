@@ -201,7 +201,7 @@ type Tensor struct {
 
 	TasksCount int
 
-	Scalars []float32
+	Scalars []float16.Float16
 	Data    []int8
 }
 
@@ -806,10 +806,10 @@ func HydrateTensorFromUI32(t *Tensor, values []uint32) {
 		block := values[i:end]
 
 		// Compute the max absolute value as scalar
-		maxAbs := float32(0.0)
+		maxAbs := float16.Float16(0.0)
 		for _, token := range block {
 			val := float32(token)
-			if absVal := float32(math.Abs(float64(val))); absVal > maxAbs {
+			if absVal := float16.Float16(math.Abs(float64(val))); absVal > maxAbs {
 				maxAbs = absVal
 			}
 		}
@@ -820,14 +820,14 @@ func HydrateTensorFromUI32(t *Tensor, values []uint32) {
 
 		// Normalize and append to Data
 		for _, token := range block {
-			val := float32(token) / maxAbs
+			val := float16.Float16(token) / maxAbs
 			t.Data = append(t.Data, int8(val))
 		}
 	}
 }
 
 // ggml_new_tensor_impl
-func NewTensor(ctx *Context, dt DType, dims uint32, ne0, ne1, ne2, ne3 uint32, scalars []float32, data []int8) *Tensor {
+func NewTensor(ctx *Context, dt DType, dims uint32, ne0, ne1, ne2, ne3 uint32, scalars []float16.Float16, data []int8) *Tensor {
 
 	// TODO: Check allowed data types on graph creation
 	//if dt != TYPE_F32 && dt != TYPE_I32 {
@@ -837,14 +837,18 @@ func NewTensor(ctx *Context, dt DType, dims uint32, ne0, ne1, ne2, ne3 uint32, s
 
 	////ggml_assert_aligned(result);
 
+	if scalars == nil {
+		total := float32(math.Ceil(float64(ne0*ne1*ne2*ne3) / 32))
+		fmt.Println(total)
+		if total == 0 {
+			total = 1
+		}
+		scalars = make([]float16.Float16, float16.Float16(total), float16.Float16(total))
+	}
+
 	if data == nil {
 		total := ne0 * ne1 * ne2 * ne3
 		data = make([]int8, total, total)
-	}
-
-	if scalars == nil {
-		total := ne0 * ne1 * ne2 * ne3 / 32
-		scalars = make([]float32, total, total)
 	}
 
 	return &Tensor{
@@ -1802,7 +1806,7 @@ func VecCopyFP32(n uint32, y, x []float32) {
 	}
 }
 
-func VecCopyI8(n uint32, scalarX, scalarY []float32, y, x []int8) {
+func VecCopyI8(n uint32, scalarX, scalarY []float16.Float16, y, x []int8) {
 	for i := uint32(0); i <= (n / 32); i++ {
 		scalarY[i] = scalarX[i]
 	}
@@ -1888,7 +1892,7 @@ func ComputeForwardRMSNormI8(params *ComputeParams, src0, dst *Tensor) {
 	}
 
 	// Temporary buffer for a dequantized row, reused for each row processed by the thread.
-	f32Row := make([]float32, nc)
+	f32Row := make([]float16.Float16, nc)
 
 	// Process the assigned rows.
 	for r := startRow; r < endRow; r++ {
@@ -1899,7 +1903,7 @@ func ComputeForwardRMSNormI8(params *ComputeParams, src0, dst *Tensor) {
 			idx := rowStartIdx + c
 			blockIdx := idx / 32
 			scalar := src0.Scalars[blockIdx]
-			f32Row[c] = float32(src0.Data[idx]) * scalar
+			f32Row[c] = float16.Float16(src0.Data[idx]) * scalar
 		}
 
 		// Step 2: Calculate the Root Mean Square (RMS) for the dequantized row.
@@ -1912,24 +1916,24 @@ func ComputeForwardRMSNormI8(params *ComputeParams, src0, dst *Tensor) {
 
 		// Step 3: Normalize the row and scale it by the weights from src1.
 		for c := uint32(0); c < nc; c++ {
-			f32Row[c] = float32(invRMS) * f32Row[c]
+			f32Row[c] = float16.Float16(invRMS) * f32Row[c]
 		}
 
 		// Step 4: Re-quantize the processed float32 row back into the int8 dst tensor.
 		// This is done in blocks of 32 to compute a new scalar for each block.
 		for c := uint32(0); c < nc; c += 32 {
 			block := f32Row[c : c+32]
-			var amax float32
+			var amax float16.Float16
 
 			// Find the absolute maximum value in the block.
 			for _, val := range block {
-				if abs := float32(math.Abs(float64(val))); abs > amax {
+				if abs := float16.Float16(math.Abs(float64(val))); abs > amax {
 					amax = abs
 				}
 			}
 
 			// Calculate and store the new scalar for the destination block.
-			newScalar := float32(0.0)
+			newScalar := float16.Float16(0.0)
 			if amax > 0 {
 				newScalar = amax / 127.0
 			}
@@ -1966,7 +1970,7 @@ func VecScaleFP32(n uint32, y []float32, v float32) {
 }
 
 // ggml_vec_scale_f32
-func VecScaleI8(scalarY float32, v float32) {
+func VecScaleI8(scalarY float16.Float16, v float16.Float16) {
 	scalarY *= v
 }
 
@@ -2033,11 +2037,11 @@ func VecMulFP32(n uint32, z, x, y []float32) {
 	}
 }
 
-func VecMulI8(scalarZ *float32, z []int8, scalarX float32, x []int8, scalarY float32, y []int8) {
-	dstF32 := make([]float32, 32)
+func VecMulI8(scalarZ *float16.Float16, z []int8, scalarX float16.Float16, x []int8, scalarY float16.Float16, y []int8) {
+	dstF32 := make([]float16.Float16, 32)
 
 	for i := uint32(0); i < uint32(len(x)); i++ {
-		dstF32[i] = (scalarX * float32(x[i])) * (scalarY * float32(y[i]))
+		dstF32[i] = (scalarX * float16.Float16(x[i])) * (scalarY * float16.Float16(y[i]))
 	}
 
 	maxValue := dstF32[0]
@@ -2047,7 +2051,7 @@ func VecMulI8(scalarZ *float32, z []int8, scalarX float32, x []int8, scalarY flo
 		}
 	}
 
-	*scalarZ = maxValue * (1.0 / 127)
+	*scalarZ = maxValue / 127
 
 	for i, val := range dstF32 {
 		z[i] = int8(val / *scalarZ)
@@ -2276,7 +2280,7 @@ func ComputeForwardMulMatI8(params *ComputeParams, src0, src1, dst *Tensor) {
 
 		src0Offset := i01*nb01 + i02*nb02 + i03*nb03
 
-		dstF32 := make([]float32, ne11)
+		dstF32 := make([]float16.Float16, ne11)
 
 		for ic := uint32(0); ic < ne11; ic++ {
 
@@ -2306,9 +2310,9 @@ func ComputeForwardMulMatI8(params *ComputeParams, src0, src1, dst *Tensor) {
 			src1ScalarPtr := src1.Scalars[src1Offet/4/32:]
 			src1Ptr := src1.Data[src1Offet/4:]
 
-			sum := float32(0.0)
+			sum := float16.Float16(0.0)
 			for i := uint32(0); i < ne00; i++ {
-				sum += (float32(src0Ptr[i]) * src0ScalarPtr[i/32]) * (float32(src1Ptr[i]) * src1ScalarPtr[i/32])
+				sum += (float16.Float16(src0Ptr[i]) * src0ScalarPtr[i/32]) * (float16.Float16(src1Ptr[i]) * src1ScalarPtr[i/32])
 			}
 
 			dstF32[ic] = sum
@@ -2324,7 +2328,7 @@ func ComputeForwardMulMatI8(params *ComputeParams, src0, src1, dst *Tensor) {
 				}
 			}
 
-			dst.Scalars[i] = maxValue * (1.0 / 127)
+			dst.Scalars[i] = maxValue / 127
 
 			for ic := uint32(i * 32); ic < uint32((i+1)*32); ic++ {
 
@@ -2532,7 +2536,7 @@ func ComputeForwardRopeI8(params *ComputeParams, src0, src1, dst *Tensor) {
 		pos := n_past + it
 
 		// Temporary buffer for one row of float32 results
-		dst_row_f32 := make([]float32, n_embd)
+		dst_row_f32 := make([]float16.Float16, n_embd)
 
 		// Apply RoPE to the first n_rot dimensions
 		for i := 0; i < int(dims); i += 2 {
@@ -2543,14 +2547,14 @@ func ComputeForwardRopeI8(params *ComputeParams, src0, src1, dst *Tensor) {
 			scalar0 := src0.Scalars[idx0/32]
 			scalar1 := src0.Scalars[idx1/32]
 
-			x0_f32 := float32(src0.Data[idx0]) * scalar0
-			x1_f32 := float32(src0.Data[idx1]) * scalar1
+			x0_f32 := float16.Float16(src0.Data[idx0]) * scalar0
+			x1_f32 := float16.Float16(src0.Data[idx1]) * scalar1
 
 			// Calculate sin and cos for the current position
 			inv_freq := 1.0 / (math.Pow(float64(rope_freq_base), float64(i)/float64(dims)) * float64(rope_freq_scale))
 			freq := float32(1.0 / inv_freq)
-			sin_val := float32(math.Sin(float64(float32(pos) * freq)))
-			cos_val := float32(math.Cos(float64(float32(pos) * freq)))
+			sin_val := float16.Float16(math.Sin(float64(float32(pos) * freq)))
+			cos_val := float16.Float16(math.Cos(float64(float32(pos) * freq)))
 
 			// Apply the 2D rotation
 			dst_row_f32[i] = x0_f32*cos_val - x1_f32*sin_val
@@ -2561,7 +2565,7 @@ func ComputeForwardRopeI8(params *ComputeParams, src0, src1, dst *Tensor) {
 		for i := int(dims); i < n_embd; i++ {
 			idx := it*n_embd + i
 			scalar := src0.Scalars[idx/32]
-			dst_row_f32[i] = float32(src0.Data[idx]) * scalar
+			dst_row_f32[i] = float16.Float16(src0.Data[idx]) * scalar
 		}
 
 		// Re-quantize the float32 row back to int8 blocks for the destination tensor
@@ -2569,16 +2573,16 @@ func ComputeForwardRopeI8(params *ComputeParams, src0, src1, dst *Tensor) {
 			block_f32 := dst_row_f32[i : i+32]
 
 			// Find the maximum absolute value in the block to determine the scaling factor
-			max_abs_val := float32(0.0)
+			max_abs_val := float16.Float16(0.0)
 			for _, val := range block_f32 {
-				abs_val := float32(math.Abs(float64(val)))
+				abs_val := float16.Float16(math.Abs(float64(val)))
 				if abs_val > max_abs_val {
 					max_abs_val = abs_val
 				}
 			}
 
 			// Define the new scalar for this block
-			new_scalar := max_abs_val * (1.0 / 127)
+			new_scalar := max_abs_val / 127
 			if new_scalar == 0.0 {
 				new_scalar = 1.0
 			}
@@ -2639,7 +2643,7 @@ func ComputeForwardScaleI8(params *ComputeParams, src0, src1, dst *Tensor) {
 	for c := uint32(ith * chunksPerThread); c < ((ith + 1) * chunksPerThread); c++ {
 		////ggml_vec_scale_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), v);
 		////VecScaleFP32(nc, (*dst.Data)[i1*dst.NE[0]:], v)
-		VecScaleI8(dst.Scalars[c], sv*float32(v))
+		VecScaleI8(dst.Scalars[c], sv*float16.Float16(v))
 	}
 
 }
@@ -2663,7 +2667,7 @@ func ComputeForwardDiagMaskInfI8(params *ComputeParams, src0, src1, dst *Tensor)
 	// Step 2: Dequantize pastCount from the src1 tensor.
 	// Since src1 is a quantized tensor with a single value, we dequantize it
 	// by multiplying its int8 data value with its float32 scalar.
-	pastCountF32 := float32(src1.Data[0]) * src1.Scalars[0]
+	pastCountF32 := float32(float16.Float16(src1.Data[0]) * src1.Scalars[0])
 
 	// We round the result to the nearest integer to get the final pastCount.
 	pastCount := uint32(pastCountF32 + 0.5)
@@ -2722,13 +2726,13 @@ func ComputeForwardSoftMaxI8(params *ComputeParams, src0, dst *Tensor) {
 	// Process one row at a time
 	for i := 0; i < n_rows; i++ {
 		// Temporary float32 slice to hold the dequantized row and the softmax result
-		row_f32 := make([]float32, n_cols)
+		row_f32 := make([]float16.Float16, n_cols)
 
 		// 1. Dequantize the current row from src0 to float32
 		for j := 0; j < n_cols; j++ {
 			idx := i*n_cols + j
 			scalar := src0.Scalars[idx/32]
-			row_f32[j] = float32(src0.Data[idx]) * scalar
+			row_f32[j] = float16.Float16(src0.Data[idx]) * scalar
 		}
 
 		// 2. Perform softmax on the float32 row
@@ -2741,10 +2745,10 @@ func ComputeForwardSoftMaxI8(params *ComputeParams, src0, dst *Tensor) {
 		}
 
 		// b. Exponentiate and sum
-		var sum_exp float32
+		var sum_exp float16.Float16
 		for j := 0; j < n_cols; j++ {
 			// Subtract max_val before exponentiating
-			row_f32[j] = float32(math.Exp(float64(row_f32[j] - max_val)))
+			row_f32[j] = float16.Float16(math.Exp(float64(row_f32[j] - max_val)))
 			sum_exp += row_f32[j]
 		}
 
@@ -2763,7 +2767,7 @@ func ComputeForwardSoftMaxI8(params *ComputeParams, src0, dst *Tensor) {
 
 			// Find the maximum absolute value in the block to determine the scaling factor.
 			// For softmax, the result is always positive, so we just need the max value.
-			max_block_val := float32(0.0)
+			max_block_val := float16.Float16(0.0)
 			for _, val := range block_f32 {
 				if val > max_block_val {
 					max_block_val = val
@@ -2771,7 +2775,7 @@ func ComputeForwardSoftMaxI8(params *ComputeParams, src0, dst *Tensor) {
 			}
 
 			// Calculate the new scalar for this block
-			new_scalar := max_block_val * (1.0 / 127)
+			new_scalar := max_block_val / 127
 			if new_scalar == 0.0 {
 				new_scalar = 1.0 // Avoid division by zero
 			}
@@ -2789,11 +2793,11 @@ func ComputeForwardSoftMaxI8(params *ComputeParams, src0, dst *Tensor) {
 }
 
 // inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, const float * y) { for (int i = 0; i < n; ++i) z[i]  = x[i] + y[i]; }
-func VecAddI8(scalarZ *float32, z []int8, scalarX float32, x []int8, scalarY float32, y []int8) {
-	dstF32 := make([]float32, 32)
+func VecAddI8(scalarZ *float16.Float16, z []int8, scalarX float16.Float16, x []int8, scalarY float16.Float16, y []int8) {
+	dstF32 := make([]float16.Float16, 32)
 
 	for i := uint32(0); i < uint32(len(x)); i++ {
-		dstF32[i] = (scalarX * float32(x[i])) + (scalarY * float32(y[i]))
+		dstF32[i] = (scalarX * float16.Float16(x[i])) + (scalarY * float16.Float16(y[i]))
 	}
 
 	maxValue := dstF32[0]
@@ -2803,7 +2807,7 @@ func VecAddI8(scalarZ *float32, z []int8, scalarX float32, x []int8, scalarY flo
 		}
 	}
 
-	*scalarZ = maxValue * (1.0 / 127)
+	*scalarZ = maxValue / 127
 
 	for i, val := range dstF32 {
 		z[i] = int8(val / *scalarZ)
@@ -2931,24 +2935,24 @@ func ComputeForwardAddI8(params *ComputeParams, src0, src1, dst *Tensor) {
 }
 
 // Sigmoid Linear Unit (SiLU) function
-func SiluFP32(x float32) float32 {
-	return x / float32(1.0+math.Exp(float64(-x)))
+func SiluFP32(x float16.Float16) float16.Float16 {
+	return x / float16.Float16(1.0+math.Exp(float64(-x)))
 }
 
 // inline static void ggml_vec_silu_f32(const int n, float * y, const float * x) {
-func VecSiluI8(scalarY *float32, y []int8, scalarX float32, x []int8) {
-	dstF32 := make([]float32, 32)
-	maxValue := float32(0.0)
+func VecSiluI8(scalarY *float16.Float16, y []int8, scalarX float16.Float16, x []int8) {
+	dstF32 := make([]float16.Float16, 32)
+	maxValue := float16.Float16(0.0)
 
 	for i := uint32(0); i < uint32(len(x)); i++ {
-		dstF32[i] = SiluFP32(scalarX * float32(x[i])) // ggml_silu_f32
+		dstF32[i] = SiluFP32(scalarX * float16.Float16(x[i])) // ggml_silu_f32
 
-		if abs := float32(math.Abs(float64(dstF32[i]))); abs > maxValue {
+		if abs := float16.Float16(math.Abs(float64(dstF32[i]))); abs > maxValue {
 			maxValue = abs
 		}
 	}
 
-	*scalarY = maxValue * (1.0 / 127)
+	*scalarY = maxValue / 127
 
 	for i, val := range dstF32 {
 		y[i] = int8(val / *scalarY)

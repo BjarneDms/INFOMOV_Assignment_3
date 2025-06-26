@@ -369,7 +369,7 @@ func parseOptions() *Options {
 	}
 
 	if opts.Context == 0 {
-		opts.Context = 1024
+		opts.Context = 2048
 	}
 
 	if opts.Predict == 0 {
